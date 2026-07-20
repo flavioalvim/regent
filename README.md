@@ -29,8 +29,20 @@ Then open a Claude Code session in the project — `/regent` and `/regent-stop` 
 (`/regent brainstorm "<question>"` opens the first round). v0 capability is file-driven
 (rounds under `.regent/brainstorm/rodadas/`); the advisor requires the `codex` CLI.
 
-Development: `PYTHONPATH=src python3 -m unittest discover -s tests`. Canonical skill content
-lives in `src/regent/templates/` (ships inside the wheel); the repo's own `.regent/skills/`
-symlinks into it (dogfood without duplication).
+Development: `PYTHONPATH=src python3 -m unittest discover -s tests`; packaging gate:
+`bash scripts/gate-package.sh`. Canonical skill content lives in `src/regent/templates/`
+(ships inside the wheel); the repo's own `.regent/skills/` symlinks into it (dogfood
+without duplication).
+
+## Protocol layer
+
+`regent.protocol` (PLAN-001) is the transactional foundation the conduction daemon will
+drive: `ControlStore` (control.json with a real CAS — mutations run inside a recoverable
+mkdir mutation mutex; atomic AND durable publication), `TurnLock` (executor-only turn
+ownership by uuid4 token; suspect detection; audited takeover with an ABA instance guard),
+stop-request representation (`record_stop_request` / `read_valid_stop_request` /
+`suspend_activity`, with turn-token fencing) and `AuditLog` (fsynced JSONL under
+`.regent/protocol/audit.jsonl`). Dormant until the conduction phase wires it to the
+skills; the v0 skills remain file-driven.
 
 MIT License © 2026 Flavio Alvim.
