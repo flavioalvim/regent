@@ -14,7 +14,9 @@ from regent.protocol.lock import LockHeld, StaleLock, TurnLock
 
 
 def _takeover_candidate(state_dir: str, audit_path: str, barrier, queue) -> None:
-    lock = TurnLock(Path(state_dir), AuditLog(Path(audit_path)), stale_after=0.0)
+    # Realistic threshold: the OLD seed lock is suspect; the winner's fresh
+    # lock (heartbeat=now) is NOT, so exactly one candidate can win.
+    lock = TurnLock(Path(state_dir), AuditLog(Path(audit_path)), stale_after=3600.0)
     barrier.wait()
     try:
         queue.put(("won", lock.takeover(actor="test", reason="race")))
@@ -77,9 +79,12 @@ class TurnLockTest(unittest.TestCase):
         graceless.takeover(actor="test", reason="crash window")
 
     def test_takeover_race_single_winner(self):
-        seed = TurnLock(self.state, self.audit, stale_after=0.0)
+        seed = TurnLock(self.state, self.audit)
         seed.acquire()
-        time.sleep(0.01)
+        owner_path = seed.path / "owner.json"
+        stale_owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        stale_owner["heartbeat_at"] = "2020-01-01T00:00:00+00:00"  # long-dead beat
+        owner_path.write_text(json.dumps(stale_owner), encoding="utf-8")
         barrier = mp.Barrier(2)
         queue = mp.Queue()
         procs = [mp.Process(target=_takeover_candidate,

@@ -46,7 +46,11 @@ das skills v0 ao control.json, sequência canônica completa de parada / `--abor
   // turn_token=null → canal do mediador (vale para a atividade, independe do turno);
   // turn_token≠null → OBRIGATORIAMENTE igual ao turn.token corrente, senão OBSOLETO
   // (takeover rotaciona o token ⇒ requests do turno anterior expiram — fencing ABA),
-  "last_concluded": null | { "type": str, "id": str, "status": str, "at": "<ISO>" }
+  "last_concluded": null | { "type": str, "id": str, "status": str, "epoch": int,
+                             "at": "<ISO>" }
+  // (emenda do build, STEP-06: last_concluded.epoch preserva o PISO de epoch através
+  //  do ciclo ocioso — concluir não pode apagar o piso; reinício do ocioso exige
+  //  epoch estritamente maior)
 }
 ```
 

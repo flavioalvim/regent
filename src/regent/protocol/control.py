@@ -115,6 +115,7 @@ def validate_control(control: Mapping[str, Any]) -> None:
     """Strict default-deny validation: exact key sets, types, timestamps and the
     ACTIVE/SUSPENDED invariants. Unknown or missing fields are rejected."""
     _require_keys(control, _TOP_KEYS, "control")
+    _require_int(control["schema_version"], "schema_version")  # rejects bool too
     if control["schema_version"] != SCHEMA_VERSION:
         raise ControlSchemaError(f"unknown schema_version: {control['schema_version']!r}")
     _require_int(control["version"], "version")
@@ -267,25 +268,32 @@ class ControlStore:
         """Epoch never regresses — INCLUDING through the idle cycle: the floor
         survives activity=null via last_concluded.epoch, and (re)starting from
         idle demands a STRICTLY greater epoch (ABA guard)."""
+        def floor_of(control: Mapping[str, Any]) -> int:
+            values = [-1]
+            if control.get("activity") is not None:
+                values.append(control["activity"]["epoch"])
+            if control.get("last_concluded") is not None:
+                values.append(control["last_concluded"]["epoch"])
+            return max(values)
+
+        current_floor = floor_of(current)
+        # The floor itself may NEVER regress — concluding an activity cannot
+        # erase it (e.g. epoch 10 concluded as last_concluded.epoch=1 or null).
+        if floor_of(new) < current_floor:
+            raise ControlSchemaError(
+                f"epoch floor must not regress ({current_floor} -> {floor_of(new)})")
         new_activity = new.get("activity")
         if new_activity is None:
             return
-        current_activity = current.get("activity")
-        floors = [a["epoch"] for a in (current_activity,) if a is not None]
-        concluded = current.get("last_concluded")
-        if concluded is not None:
-            floors.append(concluded["epoch"])
-        if not floors:
-            return
-        floor = max(floors)
-        if current_activity is None:
-            if new_activity["epoch"] <= floor:
+        if current.get("activity") is None:
+            if current_floor >= 0 and new_activity["epoch"] <= current_floor:
                 raise ControlSchemaError(
-                    f"starting from idle requires epoch > {floor} "
+                    f"starting from idle requires epoch > {current_floor} "
                     f"(got {new_activity['epoch']})")
-        elif new_activity["epoch"] < floor:
+        elif new_activity["epoch"] < current_floor:
             raise ControlSchemaError(
-                f"activity.epoch must not decrease ({floor} -> {new_activity['epoch']})")
+                f"activity.epoch must not decrease ({current_floor} -> "
+                f"{new_activity['epoch']})")
 
     def _clean_orphan_tempfiles(self) -> None:
         for orphan in self._path.parent.glob(_TMP_PREFIX + "*"):
@@ -344,21 +352,29 @@ class _MutationMutex:
         self._token: str | None = None
 
     def __enter__(self) -> "_MutationMutex":
+        # Acquisition is an atomic rename of a PRE-POPULATED dir: meta.json is
+        # written before the instance becomes visible, so an "ownerless" mutex
+        # can only mean a legacy crash artifact — a live holder mid-acquisition
+        # can never be misjudged as ownerless.
+        self._token = uuid.uuid4().hex
+        staging = self._dir.with_name(self._dir.name + f".staging-{self._token}")
+        os.mkdir(staging)
+        meta = {"pid": os.getpid(), "at": utcnow(), "token": self._token}
+        (staging / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
         deadline = time.monotonic() + self._timeout
         while True:
             try:
-                os.mkdir(self._dir)
+                os.rename(staging, self._dir)
                 break
             except OSError as exc:
-                if exc.errno != errno.EEXIST:
+                if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR):
+                    self._remove(staging)
                     raise
                 self._recover_if_stale()
                 if time.monotonic() >= deadline:
+                    self._remove(staging)
                     raise MutationMutexBusy(f"mutation mutex busy: {self._dir}") from None
                 time.sleep(self._POLL)
-        self._token = uuid.uuid4().hex
-        meta = {"pid": os.getpid(), "at": utcnow(), "token": self._token}
-        (self._dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
         return self
 
     def __exit__(self, *exc_info):
