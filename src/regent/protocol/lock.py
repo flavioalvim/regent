@@ -93,7 +93,9 @@ class TurnLock:
     def release(self, token: str) -> None:
         with self._lifecycle_mutex():
             self._owner_or_raise_locked(token)
-            _remove_tree(self._dir)
+            # Strict: a failed removal RAISES — the caller must never believe
+            # it released a lock that still exists (CONCLUSION reservation 1).
+            _remove_tree_strict(self._dir)
 
     def takeover(self, *, actor: str, reason: str,
                  control_store: "ControlStore | None" = None) -> str:

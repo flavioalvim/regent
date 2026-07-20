@@ -1,7 +1,7 @@
 """Append-only audit log under .regent/protocol/audit.jsonl.
 
-Shareable evidence per REQ-001 §3: takeovers, stale-mutex recoveries and
-stop-request discards are auditable artifacts, so they live inside the repo,
+Shareable evidence per REQ-001 §3: takeovers, stop-request discards and
+fencing anomalies are auditable artifacts, so they live inside the repo,
 never only in disposable local state. Concurrency: appends are serialized by
 an exclusive flock on the file (O_APPEND alone does not protect against a
 PARTIAL os.write interleaving with another writer's fragments). Durability:

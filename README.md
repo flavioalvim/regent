@@ -37,11 +37,14 @@ without duplication).
 ## Protocol layer
 
 `regent.protocol` (PLAN-001) is the transactional foundation the conduction daemon will
-drive: `ControlStore` (control.json with a real CAS — mutations run inside a recoverable
-mkdir mutation mutex; atomic AND durable publication), `TurnLock` (executor-only turn
-ownership by uuid4 token; suspect detection; audited takeover with an ABA instance guard),
-stop-request representation (`record_stop_request` / `read_valid_stop_request` /
-`suspend_activity`, with turn-token fencing) and `AuditLog` (fsynced JSONL under
+drive: `ControlStore` (control.json with a real CAS — every mutation runs inside a
+kernel-flock critical section, atomic AND durable publication with file+directory fsync),
+`TurnLock` (executor-only turn ownership by uuid4 token; the whole lifecycle —
+acquire/heartbeat/release/takeover — is serialized under a flock; takeover is graced,
+audited, and rotates the control turn token BEFORE the new lock exists, aborting on
+divergence), stop-request representation (`record_stop_request` /
+`read_valid_stop_request` / `suspend_activity`, with activity/epoch/turn-token staleness
+fencing) and `AuditLog` (flock-serialized, fsynced JSONL under
 `.regent/protocol/audit.jsonl`). Dormant until the conduction phase wires it to the
 skills; the v0 skills remain file-driven.
 

@@ -5,6 +5,12 @@ VERBATIM os 3 residuais do ADVISOR-REVIEW-2: recuperação de micro-mutex órfã
 stop-request por token de turno, e testes nomeados de takeover/ABA/crash-recovery/
 durabilidade do audit.*
 
+> ⚠️ **Emenda do build (STEP-08, declarada):** onde este plano descreve mutex por
+> `mkdir`/meta.json com recuperação de órfão, a implementação final usa **flock do kernel**
+> em arquivo dedicado (single-host v0) — aquisição atômica, liberação automática na morte
+> do detentor, sem código de evicção/recuperação. Motivo e trajeto nas revisões 1–5 do
+> build (`build/ADVISOR-REVIEW*.md`, `build/STEP-0{5..8}.md`).
+
 ## Objetivo
 
 Implementar `regent.protocol` — fundação transacional do produto: estado de controle com

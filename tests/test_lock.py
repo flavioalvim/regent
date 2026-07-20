@@ -1,6 +1,7 @@
 """Directed tests for the executor turn lock (PLAN-001 STEP-02)."""
 
 import json
+import os
 import multiprocessing as mp
 import subprocess
 import tempfile
@@ -77,6 +78,41 @@ class TurnLockTest(unittest.TestCase):
         time.sleep(0.01)
         self.assertEqual(graceless.status()["state"], "suspect")
         graceless.takeover(actor="test", reason="crash window")
+
+    def test_release_removal_failure_raises(self):
+        token = self.lock.acquire()
+        os.chmod(self.lock.path, 0o500)  # children cannot be unlinked
+        try:
+            with self.assertRaises(OSError):
+                self.lock.release(token)
+            self.assertTrue(self.lock.path.exists())  # caller KNOWS it still exists
+        finally:
+            os.chmod(self.lock.path, 0o700)
+        self.lock.release(token)  # now it works, and is verified gone
+        self.assertFalse(self.lock.path.exists())
+
+    def test_takeover_removal_failure_leaves_control_unrotated(self):
+        stale = TurnLock(self.state, self.audit, stale_after=0.0)
+        old_token = stale.acquire()
+        store = ControlStore(Path(self._tmp.name) / "control.json", self.audit)
+        store.seed()
+        body = initial_control()
+        body["activity"] = {"type": "build", "id": "PLAN-001", "epoch": 1,
+                            "state": "ACTIVE", "suspension": None,
+                            "turn": {"owner": "executor", "token": old_token,
+                                     "acquired_at": "2026-01-01T00:00:00+00:00"}}
+        store.cas_write(0, body)
+        time.sleep(0.01)
+        os.chmod(stale.path, 0o500)  # strict removal will fail
+        try:
+            with self.assertRaises(OSError):
+                stale.takeover(actor="mediator", reason="stale",
+                               control_store=store)
+        finally:
+            os.chmod(stale.path, 0o700)
+        control = store.load()
+        self.assertEqual(control["activity"]["turn"]["token"], old_token)  # NOT rotated
+        self.assertTrue(stale.path.exists())  # old lock preserved
 
     def test_acquire_refuses_ownerless_dir(self):
         # A plain acquire must NEVER absorb an existing dir — ownerless
