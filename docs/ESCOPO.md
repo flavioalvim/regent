@@ -26,7 +26,7 @@ produto é, o que sai do ArtNFT, o que se corrige no caminho e o que fica para d
 | Escopo v1 | As **três camadas juntas** (deliberação + protocolo + condução), com o protocolo como núcleo e módulos separáveis — sem split em pacotes por ora |
 | Trilha da extração | **Repo novo sem trilha** (velocidade); o 1º dogfood real será uma IMP conduzida dentro do próprio regente, depois que o `init` existir |
 | Idioma | Código **100% inglês** (identificadores migram na extração, com testes garantindo equivalência); documentação markdown em PT-BR |
-| Licença | **Nenhuma por ora** — repo privado, todos os direitos reservados; licença aberta só se/quando publicar |
+| Licença | ~~Nenhuma por ora~~ **MIT, público** (decisão do dono 2026-07-20, na publicação do PyPI) |
 | Repo | `~/projetos/regente`, GitHub privado `flavioalvim/regente` |
 
 Nomes considerados e descartados: `baton`/`baton-cli`/`batuta`/`maestro-loop` (tomados no

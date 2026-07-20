@@ -33,4 +33,4 @@ Development: `PYTHONPATH=src python3 -m unittest discover -s tests`. Canonical s
 lives in `src/regent/templates/` (ships inside the wheel); the repo's own `.regent/skills/`
 symlinks into it (dogfood without duplication).
 
-© Flavio Alvim. All rights reserved (license to be decided).
+MIT License © 2026 Flavio Alvim.
