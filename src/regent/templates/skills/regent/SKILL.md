@@ -70,7 +70,7 @@ executable gate) → advisor review (+1 rebuttal cycle) → `APPROVAL.md`
 **Build** (REQ-005 protocol, unchanged in content): baseline → per step: clean worktree
 (the exempted operational files `control.json`/`audit.jsonl` may be dirty — they are
 staged into the commit that closes the current boundary; record `control.version` from
-`regent status` at step start, and BEFORE staging them run `regent control explain`:
+`regent status` at step start, and BEFORE staging them run `regent control explain --since-version <o valor registrado>`:
 exit 0 = explained operational churn, `UNATTRIBUTABLE` = the step commit MUST fail) →
 implement → run the gate for real →
 `build/STEP-NN.md` → deliberate commit with trailer `Regent-Step: PLAN-NNN/STEP-NN` →

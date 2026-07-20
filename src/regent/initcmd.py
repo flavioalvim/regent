@@ -63,6 +63,19 @@ def _manifest_key(project_root: Path, path: Path) -> str | None:
     return str(rel)
 
 
+def _escapes_root(project_root: Path, path: Path) -> bool:
+    """True when any existing ancestor is a symlink leading OUTSIDE the host —
+    seeding through it could write to arbitrary targets."""
+    resolved_root = project_root.resolve()
+    probe = path.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return not probe.resolve().is_relative_to(resolved_root)
+    except (OSError, ValueError):
+        return True
+
+
 def _existing_state(kind: str, path: Path, payload: str,
                     known_hashes: list[str]) -> str:
     """'absent' | 'identical' | 'upgradeable' | 'divergent'."""
@@ -106,6 +119,9 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
 
     states = {}
     for kind, path, payload in plan:
+        if kind != "symlink" and _escapes_root(project_root, path):
+            states[path] = "divergent"  # symlinked ancestor escaping the host
+            continue
         key = _manifest_key(project_root, path)
         known = manifest.get(key, []) if key else []
         states[path] = _existing_state(kind, path, payload, known)
@@ -125,6 +141,17 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
         print("already initialized — nothing to do.", file=out)
         _warn_missing_clis(out)
         return EXIT_OK
+
+    journal = project_root / ".regent" / ".init-journal.json"
+    if journal.exists():
+        print("note: a previous init did not finish (journal present); "
+              "this run completes it (manifest re-run is idempotent).", file=out)
+    regent_dir_created = not (project_root / ".regent").exists()
+    (project_root / ".regent").mkdir(exist_ok=True)
+    journal.write_text(json.dumps(
+        {"at": __import__("regent.protocol.audit", fromlist=["utcnow"]).utcnow(),
+         "paths": [str(p.relative_to(project_root)) for _, p, _ in todo]}),
+        encoding="utf-8")
 
     created: list[Path] = []
     replaced: list[tuple[Path, bytes]] = []
@@ -150,14 +177,30 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
                              ).seed()
                 created.append(path)
     except OSError as exc:
-        _rollback(created, replaced)
-        print(f"error: seeding failed ({exc}); all changes rolled back.", file=out)
+        failures = _rollback(created, replaced)
+        try:
+            journal.unlink()  # the rollback itself converged; marker done
+            if regent_dir_created:
+                (project_root / ".regent").rmdir()
+        except OSError:
+            pass
+        if failures:
+            print(f"error: seeding failed ({exc}); rollback INCOMPLETE — "
+                  f"unrestored: {failures}. Re-run init to converge "
+                  f"(manifest upgrades are idempotent).", file=out)
+        else:
+            print(f"error: seeding failed ({exc}); all changes rolled back.",
+                  file=out)
         return EXIT_FAILURE
 
     for kind, path, _ in todo:
         verb = "upgraded" if states[path] == "upgradeable" else "seeded"
         print(f"{verb} {path.relative_to(project_root)}"
               + (" (symlink)" if kind == "symlink" else ""), file=out)
+    try:
+        journal.unlink()
+    except OSError:
+        pass
     _warn_missing_clis(out)
     print("regent initialized. Open a Claude Code session here and use /regent.",
           file=out)
@@ -175,20 +218,35 @@ def _missing_parents(path: Path) -> list[Path]:
 
 def _atomic_write(path: Path, payload: str) -> None:
     import os
-    tmp = path.with_name(path.name + ".regent-tmp")
-    tmp.write_text(payload, encoding="utf-8")
+    import uuid
+    tmp = path.with_name(f".{path.name}.regent-tmp-{uuid.uuid4().hex}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     os.replace(tmp, path)
 
 
-def _rollback(created: list[Path], replaced: list[tuple[Path, bytes]]) -> None:
+def _rollback(created: list[Path],
+              replaced: list[tuple[Path, bytes]]) -> list[str]:
+    """Restores originals and removes created paths; returns what could NOT be
+    restored (never silently claims a full rollback)."""
     import os
+    import uuid
+    failures: list[str] = []
     for path, original in replaced:
         try:
-            tmp = path.with_name(path.name + ".regent-tmp")
+            tmp = path.with_name(f".{path.name}.regent-tmp-{uuid.uuid4().hex}")
             tmp.write_bytes(original)
             os.replace(tmp, path)
         except OSError:
-            pass
+            failures.append(str(path))
     for path in reversed(created):
         try:
             if path.is_symlink() or path.is_file():
@@ -196,7 +254,8 @@ def _rollback(created: list[Path], replaced: list[tuple[Path, bytes]]) -> None:
             elif path.is_dir():
                 path.rmdir()
         except OSError:
-            pass  # best effort; leftover paths are reported by the failure message
+            failures.append(str(path))
+    return failures
 
 
 def _warn_missing_clis(out) -> None:

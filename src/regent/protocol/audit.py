@@ -54,6 +54,10 @@ class AuditLog:
             return []
         records = []
         for line in self._path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 records.append(json.loads(line))
+            except json.JSONDecodeError:
+                records.append({"event": "__corrupt_line__", "raw": line[:200]})
         return records

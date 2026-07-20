@@ -142,7 +142,8 @@ class ActivityService:
 
     def _start_locked(self, activity_type: str, activity_id: str) -> dict:
         if activity_type not in ACTIVITY_TYPES:
-            raise ActivityError({"type": activity_type}, "unknown activity type")
+            raise ActivityError(f"unknown activity type: {activity_type!r}",
+                                "unknown activity type")  # USAGE: detail is str
         control = self._recover()
         if control["activity"] is not None:
             raise ActivityOpen({"activity": _activity_obj(control["activity"])})
@@ -168,8 +169,7 @@ class ActivityService:
         if activity["state"] != "SUSPENDED":
             raise NotSuspended({"state": activity["state"]})
         if activity_id is not None and activity["id"] != activity_id:
-            raise ActivityOpen({"activity": _activity_obj(activity),
-                                "asked": activity_id})
+            raise ActivityOpen({"activity": _activity_obj(activity)})
         suspension = activity["suspension"]
         token = self.lock.acquire()
         _maybe_crash("resume:after_lock")
@@ -421,35 +421,61 @@ ALLOWED_STEP_AUDIT_EVENTS = frozenset({"stop_request_discarded"})
 
 
 def explain_control_diff(before: dict, after: dict,
-                         audit_delta: list[dict] | None = None) -> dict:
+                         audit_delta: list[dict] | None = None,
+                         since_version: int | None = None) -> dict:
     """Attributability check for the exempted operational files (PLAN-002
-    commit choreography), DEFAULT-DENY: only mutations the running operation
-    can legitimately produce are explained — `version`/`updated_at` churn and
-    the ARRIVAL of a well-formed stop_request bound to the CURRENT activity
-    (it belongs to the NEXT operational commit). Everything else — activity or
-    last_concluded changes, schema_version changes, a stop_request that
-    disappeared or was replaced, or audit events outside the allowed set — is
-    unexplained and must fail the step commit."""
+    commit choreography), DEFAULT-DENY with VERSION ACCOUNTING: nothing is
+    explained by default. The only legitimate in-step mutations are the
+    ARRIVAL of a well-formed stop_request bound to the CURRENT activity and
+    an audited stale-request discard; the version delta must equal the count
+    of those explained mutations (a bare version jump is unexplained).
+    `since_version` is the skill's step-start snapshot: the HEAD version must
+    not exceed it, and it must not exceed the worktree version."""
     explained, unexplained = [], []
-    for key in ("version", "updated_at"):
-        if before.get(key) != after.get(key):
-            explained.append(key)
     if before.get("schema_version") != after.get("schema_version"):
         unexplained.append("schema_version")
+    for key in ("activity", "last_concluded"):
+        if before.get(key) != after.get(key):
+            unexplained.append(key)
+
+    accountable = 0
     b_req, a_req = before.get("stop_request"), after.get("stop_request")
     if b_req != a_req:
         activity = after.get("activity") or before.get("activity")
         arrival_ok = (b_req is None and isinstance(a_req, dict)
                       and activity is not None
                       and a_req.get("activity_id") == activity.get("id")
-                      and a_req.get("activity_epoch") == activity.get("epoch"))
-        (explained if arrival_ok else unexplained).append("stop_request")
-    for key in ("activity", "last_concluded"):
-        if before.get(key) != after.get(key):
-            unexplained.append(key)
+                      and a_req.get("activity_epoch") == activity.get("epoch")
+                      and set(a_req) == {"id", "activity_id", "activity_epoch",
+                                         "turn_token", "reason", "requested_at"})
+        if arrival_ok:
+            explained.append("stop_request")
+            accountable += 1
+        else:
+            unexplained.append("stop_request")
     for event in (audit_delta or []):
-        if event.get("event") not in ALLOWED_STEP_AUDIT_EVENTS:
-            unexplained.append(f"audit:{event.get('event')}")
+        name = event.get("event")
+        if name in ALLOWED_STEP_AUDIT_EVENTS and event.get("request_id"):
+            accountable += 1  # an audited discard also bumps the version
+        else:
+            unexplained.append(f"audit:{name}")
+
+    b_ver, a_ver = before.get("version"), after.get("version")
+    if b_ver != a_ver:
+        delta = (a_ver - b_ver) if isinstance(a_ver, int)             and isinstance(b_ver, int) else None
+        if delta is not None and 0 < delta <= accountable:
+            explained.append("version")
+            if before.get("updated_at") != after.get("updated_at"):
+                explained.append("updated_at")
+        else:
+            unexplained.append("version")  # bare/unaccounted version churn
+    elif before.get("updated_at") != after.get("updated_at"):
+        unexplained.append("updated_at")
+
+    if since_version is not None:
+        if not (isinstance(b_ver, int) and isinstance(a_ver, int)
+                and b_ver <= since_version <= a_ver):
+            unexplained.append("since_version")
     return {"explained": explained, "unexplained": unexplained}
 
 

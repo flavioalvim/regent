@@ -67,16 +67,18 @@ class Step06FixesTest(unittest.TestCase):
         self.assertIn("stop_request", diff["unexplained"])
 
         legit = dict(before, version=2, updated_at="t2",
-                     stop_request={"activity_id": "PLAN-A", "activity_epoch": 0})
+                     stop_request={"id": "ab" * 16, "activity_id": "PLAN-A",
+                                   "activity_epoch": 0, "turn_token": None,
+                                   "reason": "owner", "requested_at": "t2"})
         diff = explain_control_diff(before, legit)
         self.assertIn("stop_request", diff["explained"])
         self.assertEqual(diff["unexplained"], [])
 
         vanished = dict(before, version=2, updated_at="t2")
-        diff = explain_control_diff(dict(before, stop_request={"activity_id":
-                                                               "PLAN-A",
-                                                               "activity_epoch": 0}),
-                                    vanished)
+        full_req = {"id": "ab" * 16, "activity_id": "PLAN-A",
+                    "activity_epoch": 0, "turn_token": None,
+                    "reason": None, "requested_at": "t1"}
+        diff = explain_control_diff(dict(before, stop_request=full_req), vanished)
         self.assertIn("stop_request", diff["unexplained"])  # disappearance
 
     def test_explain_flags_disallowed_audit_events(self):
@@ -114,6 +116,60 @@ class Step06FixesTest(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(payload["error"], "UNATTRIBUTABLE")
         self.assertIn("activity", payload["detail"]["unexplained"])
+
+    def test_explain_bare_version_jump_unexplained(self):
+        before = {"schema_version": 1, "version": 10, "updated_at": "t1",
+                  "activity": None, "stop_request": None, "last_concluded": None}
+        jumped = dict(before, version=999, updated_at="t2")
+        diff = explain_control_diff(before, jumped)
+        self.assertIn("version", diff["unexplained"])  # unaccounted churn
+
+    def test_explain_since_version_snapshot_enforced(self):
+        before = {"schema_version": 1, "version": 5, "updated_at": "t1",
+                  "activity": None, "stop_request": None, "last_concluded": None}
+        after = dict(before)
+        diff = explain_control_diff(before, after, since_version=4)  # < HEAD
+        self.assertIn("since_version", diff["unexplained"])
+        diff = explain_control_diff(before, after, since_version=5)
+        self.assertNotIn("since_version", diff["unexplained"])
+
+    def test_control_explain_rejects_rewritten_audit(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        for k, v in (("user.name", "t"), ("user.email", "t@t")):
+            subprocess.run(["git", "-C", str(self.root), "config", k, v], check=True)
+        self.service.start("build", "PLAN-B")
+        self.service.audit.append({"event": "fixture", "seq": 1})
+        self.service.audit.append({"event": "fixture", "seq": 2})
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "flush"],
+                       check=True)
+        audit_path = self.service.audit.path
+        lines = audit_path.read_text(encoding="utf-8").splitlines()
+        audit_path.write_text("\n".join(reversed(lines)) + "\n",
+                              encoding="utf-8")  # same count, rewritten history
+        from regent.cli import main
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = main(["control", "--project", str(self.root), "explain"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 3)
+        self.assertIn("audit:history-not-append-only",
+                      payload["detail"]["unexplained"])
+
+    def test_init_refuses_ancestor_symlink_escape(self):
+        import io
+        import shutil
+        outside = Path(self._tmp.name) / "outside-skills"
+        outside.mkdir()
+        skills = self.root / ".regent" / "skills"
+        skills.parent.mkdir(parents=True, exist_ok=True)
+        skills.symlink_to(outside)  # ancestor dir escapes the host
+        out = io.StringIO()
+        code = run_init(self.root, out=out)
+        self.assertEqual(code, EXIT_CONFLICT)
+        self.assertEqual(list(outside.iterdir()), [])  # nothing written outside
 
     # -- finding 7: reason flows and suspended checkpoint in status ---------
 

@@ -95,7 +95,8 @@ def build_parser(sub) -> None:
                                help="control.json attributability helpers")
     p_control.add_argument("--project", default=None)
     control_sub = p_control.add_subparsers(dest="control_command", required=True)
-    control_sub.add_parser("explain")
+    p = control_sub.add_parser("explain")
+    p.add_argument("--since-version", type=int, default=None, dest="since_version")
 
 
 def run(args, out=None) -> int:
@@ -117,7 +118,8 @@ def run(args, out=None) -> int:
                 return _emit({"ok": True, **result}, 0, out)
             return _emit(service.stop_check(), 0, out)
         if args.command == "control":
-            return _run_control_explain(service, root, out)
+            return _run_control_explain(service, root, out,
+                                        since_version=args.since_version)
         return _fail("USAGE", f"unknown command {args.command!r}", out)
     except ActivityError as exc:
         return _fail(exc.code, exc.detail, out)
@@ -137,8 +139,8 @@ def run(args, out=None) -> int:
             pass
         held = service.lock.status().get("owner") or {}
         held_token = held.get("token")
-        return _fail("TOKEN_MISMATCH", {"control_token": control_token,
-                                        "held_token": held_token}, out)
+        return _fail("TOKEN_MISMATCH", {"control_token": control_token or "",
+                                        "held_token": held_token or ""}, out)
     except (LockHeld, StaleLock) as exc:
         status = service.lock.status()
         return _fail("LOCK_HELD" if isinstance(exc, LockHeld) else "LOCK_SUSPECT",
@@ -176,9 +178,11 @@ def _dispatch_activity(service: ActivityService, args) -> dict:
     raise _UsageError(f"unknown activity command {command!r}")
 
 
-def _run_control_explain(service: ActivityService, root: Path, out) -> int:
-    """`regent control explain` — attributability of the exempted operational
-    files vs git HEAD (PLAN-002 choreography). Unexplained changes exit 3."""
+def _run_control_explain(service: ActivityService, root: Path, out,
+                         since_version: int | None = None) -> int:
+    """`regent control explain [--since-version N]` — attributability of the
+    exempted operational files vs git HEAD (PLAN-002 choreography), with the
+    skill's step-start version snapshot. Unexplained changes exit 3."""
     import json as _json
     import subprocess
     from .activity import explain_control_diff
@@ -194,24 +198,42 @@ def _run_control_explain(service: ActivityService, root: Path, out) -> int:
         return _emit({"explained": ["control.json is new in this commit"],
                       "unexplained": []}, 0, out)
     audit_delta = _audit_delta(service, root)
-    diff = explain_control_diff(before, after, audit_delta)
+    if audit_delta is None:  # history rewritten or corrupt: default-deny
+        diff = {"explained": [], "unexplained": ["audit:history-not-append-only"]}
+    else:
+        diff = explain_control_diff(before, after, audit_delta,
+                                    since_version=since_version)
     if diff["unexplained"]:
         return _fail("UNATTRIBUTABLE", diff, out)
     return _emit(diff, 0, out)
 
 
-def _audit_delta(service: ActivityService, root: Path) -> list[dict]:
+def _audit_delta(service: ActivityService, root: Path) -> list[dict] | None:
+    """REAL diff of the append-only audit: HEAD lines must be a PREFIX of the
+    worktree lines (rewritten/removed history returns None = default-deny)."""
     import json as _json
     import subprocess
     try:
         head_raw = subprocess.run(
             ["git", "-C", str(root), "show", "HEAD:.regent/protocol/audit.jsonl"],
             capture_output=True, text=True, check=True).stdout
-        head_count = len([l for l in head_raw.splitlines() if l.strip()])
     except subprocess.CalledProcessError:
-        head_count = 0
-    records = service.audit.read_all()
-    return records[head_count:]
+        head_raw = ""
+    head_lines = [l for l in head_raw.splitlines() if l.strip()]
+    try:
+        work_raw = service.audit.path.read_text(encoding="utf-8")
+    except OSError:
+        work_raw = ""
+    work_lines = [l for l in work_raw.splitlines() if l.strip()]
+    if work_lines[:len(head_lines)] != head_lines:
+        return None  # not append-only relative to HEAD
+    delta = []
+    for line in work_lines[len(head_lines):]:
+        try:
+            delta.append(_json.loads(line))
+        except ValueError:
+            return None  # corrupt new line: default-deny
+    return delta
 
 
 def _capabilities(status_report: dict) -> dict:
