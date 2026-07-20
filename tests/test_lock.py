@@ -73,10 +73,19 @@ class TurnLockTest(unittest.TestCase):
 
     def test_ownerless_lock_suspect_after_grace(self):
         graceless = TurnLock(self.state, self.audit, ownerless_grace=0.0)
-        graceless.path.mkdir()  # crash window: mkdir happened, owner.json never written
+        graceless.path.mkdir()  # legacy crash artifact: dir without owner.json
         time.sleep(0.01)
         self.assertEqual(graceless.status()["state"], "suspect")
         graceless.takeover(actor="test", reason="crash window")
+
+    def test_acquire_refuses_ownerless_dir(self):
+        # A plain acquire must NEVER absorb an existing dir — ownerless
+        # included (POSIX rename could replace an empty target silently);
+        # eviction is takeover's graced, audited job.
+        self.lock.path.mkdir()
+        with self.assertRaises(LockHeld):
+            self.lock.acquire()
+        self.assertTrue(self.lock.path.exists())  # untouched
 
     def test_takeover_race_single_winner(self):
         seed = TurnLock(self.state, self.audit)

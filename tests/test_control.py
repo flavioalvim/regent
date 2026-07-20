@@ -64,6 +64,15 @@ def _audit_appender(root: str, worker: int, barrier) -> None:
         log.append({"event": "concurrency", "worker": worker, "seq": i})
 
 
+def _flock_holder(lock_file: str, hold_seconds: float, started) -> None:
+    import fcntl
+    import time as _time
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    started.set()
+    _time.sleep(hold_seconds)
+
+
 def _touch(body):
     """A REAL mutation (mutate() skips publishing unchanged bodies)."""
     body["last_concluded"] = {"type": "plan", "id": "PLAN-TOUCH",
@@ -136,25 +145,23 @@ class ControlStoreTest(unittest.TestCase):
         control = self.store.mutate(_touch)  # crashed mutex must not block
         self.assertEqual(control["version"], 1)
 
-    def test_mutation_mutex_stale_recovered_after_crash(self):
-        mutex = self.root / "control.json.lock.d"
-        mutex.mkdir()
-        (mutex / "meta.json").write_text(
-            json.dumps({"pid": 99999999, "at": "2026-01-01T00:00:00+00:00",
-                        "token": "dead-holder"}),
-            encoding="utf-8")
-        control = self.store.mutate(_touch)
+    def test_mutex_auto_released_after_holder_death(self):
+        # A holder that dies mid-critical-section (the crashing writer exits
+        # while its flock is held) must not block anyone: the kernel releases
+        # the flock automatically. No eviction/recovery code exists to race on.
+        proc = mp.Process(target=_crashing_writer, args=(str(self.root),))
+        proc.start()
+        proc.join(timeout=15)
+        self.assertEqual(proc.exitcode, 42)
+        control = self.store.mutate(_touch)  # proceeds immediately
         self.assertEqual(control["version"], 1)
-        events = [r["event"] for r in AuditLog(self.root / "audit.jsonl").read_all()]
-        self.assertIn("mutation_mutex_recovered", events)
 
-    def test_mutation_mutex_alive_holder_never_evicted(self):
-        mutex = self.root / "control.json.lock.d"
-        mutex.mkdir()
-        (mutex / "meta.json").write_text(  # ALIVE pid with an ancient timestamp
-            json.dumps({"pid": os.getpid(), "at": "2020-01-01T00:00:00+00:00",
-                        "token": "alive-holder"}),
-            encoding="utf-8")
+    def test_mutex_alive_holder_blocks_until_timeout(self):
+        started = mp.Event()
+        holder = mp.Process(target=_flock_holder,
+                            args=(str(self.root / "control.json.lock"), 3.0, started))
+        holder.start()
+        self.assertTrue(started.wait(timeout=10))
         impatient = ControlStore(self.root / "control.json",
                                  AuditLog(self.root / "audit.jsonl"),
                                  mutation_timeout=0.2)
@@ -162,9 +169,8 @@ class ControlStoreTest(unittest.TestCase):
         with self.assertRaises((MutationMutexBusy, VersionConflict)):
             impatient.mutate(_touch, retries=1)
         self.assertEqual(self.store.load()["version"], 0)  # nothing was published
-        self.assertTrue((mutex / "meta.json").exists())  # holder NOT evicted
-        events = [r["event"] for r in AuditLog(self.root / "audit.jsonl").read_all()]
-        self.assertNotIn("mutation_mutex_recovered", events)
+        holder.terminate()
+        holder.join(timeout=10)
 
     def test_epoch_monotonic_through_idle_cycle(self):
         token = "ef" * 16

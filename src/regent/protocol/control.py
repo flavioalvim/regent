@@ -7,14 +7,14 @@ default-deny) under the regent v1 actor model (REQ-003: single executor).
 
 Concurrency: read-check-replace alone is NOT a CAS (two writers could both
 validate the same version — lost update). Every mutation therefore runs inside
-a short exclusive mutation mutex (mkdir-style, distinct from the turn lock;
-never held while acquiring the turn lock — acquire the turn lock first, then
-mutate). Mutex instances carry an identity token; recovery ONLY evicts a
-holder whose pid is dead (or an ownerless dir past the timeout) — an alive
-holder is never evicted, however slow, so two CAS winners are impossible.
-Recovery is audited BEFORE acting and claims the judged instance by atomic
-rename (two concurrent recoverers cannot both evict). The holder re-verifies
-its mutex identity immediately before publishing.
+a short exclusive critical section backed by a kernel **flock** on a dedicated
+lock FILE (v0 is single-host by REQ-003, where flock is strictly stronger than
+any directory-mutex scheme: acquisition is atomic in the kernel, a dead
+holder's lock is released AUTOMATICALLY, and there is no stale-judgment,
+eviction or recovery code to race on). The lock file is created once and never
+unlinked (unlinking would allow two locks on different inodes). The flock is
+never held while acquiring the turn lock — lock-ordering is lifecycle →
+mutation, nowhere reversed.
 
 Publication separates atomicity from durability: tempfile in the same
 directory → flush+fsync(file) → os.replace → fsync(directory).
@@ -22,7 +22,7 @@ directory → flush+fsync(file) → os.replace → fsync(directory).
 
 from __future__ import annotations
 
-import errno
+import fcntl
 import json
 import os
 import time
@@ -182,7 +182,7 @@ class ControlStore:
                  mutation_timeout: float = 60.0) -> None:
         self._path = Path(path)
         self._audit = audit
-        self._mutex_dir = self._path.with_name(self._path.name + ".lock.d")
+        self._mutex_file = self._path.with_name(self._path.name + ".lock")
         self._mutation_timeout = mutation_timeout
 
     @property
@@ -220,7 +220,7 @@ class ControlStore:
 
         With turn_token set, additionally enforces ABA fencing: the CURRENT
         stored control must carry that token as the active turn."""
-        with self._mutation_mutex() as mutex:
+        with self._mutation_mutex():
             self._clean_orphan_tempfiles()
             current = self.load()
             if turn_token is not None:
@@ -234,7 +234,7 @@ class ControlStore:
             control["updated_at"] = utcnow()
             validate_control(control)
             self._check_epoch_monotonic(current, control)
-            self._publish(control, mutex=mutex)
+            self._publish(control)
             return control
 
     def mutate(self, fn: Callable[[dict[str, Any]], dict[str, Any]], *,
@@ -259,8 +259,8 @@ class ControlStore:
 
     # -- critical section -------------------------------------------------
 
-    def _mutation_mutex(self) -> "_MutationMutex":
-        return _MutationMutex(self._mutex_dir, self._audit, self._mutation_timeout)
+    def _mutation_mutex(self) -> "_FlockMutex":
+        return _FlockMutex(self._mutex_file, self._mutation_timeout)
 
     @staticmethod
     def _check_epoch_monotonic(current: Mapping[str, Any],
@@ -302,8 +302,7 @@ class ControlStore:
             except OSError:
                 pass
 
-    def _publish(self, control: Mapping[str, Any],
-                 mutex: "_MutationMutex | None" = None) -> None:
+    def _publish(self, control: Mapping[str, Any]) -> None:
         tmp = self._path.with_name(f"{_TMP_PREFIX}{uuid.uuid4().hex}")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
@@ -313,11 +312,6 @@ class ControlStore:
                 os.fsync(handle.fileno())
             if _CRASH_BEFORE_REPLACE:  # test hook: simulated crash
                 os._exit(42)
-            if mutex is not None:
-                # Coupled to publication: the ownership check is the LAST thing
-                # before os.replace, so a displaced holder aborts here instead
-                # of double-publishing.
-                mutex.verify_still_held()
             os.replace(tmp, self._path)
             dir_fd = os.open(self._path.parent, os.O_RDONLY)
             try:
@@ -334,132 +328,44 @@ class ControlStore:
 _CRASH_BEFORE_REPLACE = False  # flipped only by crash-consistency tests
 
 
-class _MutationMutex:
-    """Short exclusive mkdir-style mutex around control mutations.
+class _FlockMutex:
+    """Exclusive critical section backed by a kernel flock on a lock FILE.
 
-    Instance identity: meta.json carries {pid, at, token}. Recovery ONLY
-    evicts a dead holder (or an ownerless dir past the timeout) — an alive
-    holder is never evicted. Eviction is audited BEFORE acting and claims the
-    judged instance by atomic rename, so concurrent recoverers cannot both
-    evict, and can never evict a fresh instance (token compare)."""
+    Single-host guarantees (REQ-003 v0): acquisition is atomic in the kernel;
+    a dead holder's flock is released AUTOMATICALLY — there is no staleness
+    judgment, eviction or recovery code, hence nothing to race on. The lock
+    file is created once and NEVER unlinked (unlinking would allow two locks
+    on different inodes)."""
 
     _POLL = 0.01
 
-    def __init__(self, mutex_dir: Path, audit: AuditLog, timeout: float) -> None:
-        self._dir = mutex_dir
-        self._audit = audit
+    def __init__(self, lock_file: Path, timeout: float) -> None:
+        self._file = lock_file
         self._timeout = timeout
-        self._token: str | None = None
+        self._fd: int | None = None
 
-    def __enter__(self) -> "_MutationMutex":
-        # Acquisition is an atomic rename of a PRE-POPULATED dir: meta.json is
-        # written before the instance becomes visible, so an "ownerless" mutex
-        # can only mean a legacy crash artifact — a live holder mid-acquisition
-        # can never be misjudged as ownerless.
-        self._token = uuid.uuid4().hex
-        staging = self._dir.with_name(self._dir.name + f".staging-{self._token}")
-        os.mkdir(staging)
-        meta = {"pid": os.getpid(), "at": utcnow(), "token": self._token}
-        (staging / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    def __enter__(self) -> "_FlockMutex":
+        self._file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._file, os.O_RDWR | os.O_CREAT, 0o644)
         deadline = time.monotonic() + self._timeout
         while True:
             try:
-                os.rename(staging, self._dir)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except OSError as exc:
-                if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR):
-                    self._remove(staging)
-                    raise
-                self._recover_if_stale()
+            except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    self._remove(staging)
-                    raise MutationMutexBusy(f"mutation mutex busy: {self._dir}") from None
+                    os.close(fd)
+                    raise MutationMutexBusy(
+                        f"critical section busy: {self._file}") from None
                 time.sleep(self._POLL)
+        self._fd = fd
         return self
 
     def __exit__(self, *exc_info):
-        # Token-conditional removal: NEVER delete a mutex instance that is not
-        # ours (we may have been evicted and a fresh holder may own the path).
-        meta = self._read_meta(self._dir)
-        if meta is not None and meta.get("token") == self._token:
-            self._remove(self._dir)
-        return False
-
-    def verify_still_held(self) -> None:
-        meta = self._read_meta(self._dir)
-        if meta is None or meta.get("token") != self._token:
-            raise MutationMutexBusy("mutation mutex lost during critical section")
-
-    def _recover_if_stale(self) -> None:
-        meta = self._read_meta(self._dir)
-        stale_reason = None
-        if meta is not None:
-            holder_pid = int(meta.get("pid", -1))
-            if not _pid_alive(holder_pid):
-                stale_reason = f"holder pid {holder_pid} is dead"
-            # An ALIVE holder is never evicted, however old: evicting it could
-            # let two CAS writers win. Callers time out with MutationMutexBusy.
-        else:
+        if self._fd is not None:
             try:
-                age = time.time() - self._dir.stat().st_mtime
-            except OSError:
-                return  # already gone
-            if age > self._timeout:
-                stale_reason = f"ownerless mutex dir for {int(age)}s > timeout"
-        if not stale_reason:
-            return
-        judged_token = (meta or {}).get("token")
-        # Audit the INTENT first: a crash after this point leaves a record.
-        self._audit.append({"event": "mutation_mutex_recovered",
-                            "mutex": str(self._dir), "reason": stale_reason,
-                            "evicted_token": judged_token})
-        # Re-check the canonical instance right before claiming: if the judged
-        # (dead) instance was already replaced by a fresh one, do not touch it.
-        recheck = self._read_meta(self._dir)
-        if (recheck or {}).get("token") != judged_token:
-            return
-        aside = self._dir.with_name(self._dir.name + f".evict-{uuid.uuid4().hex}")
-        try:
-            os.rename(self._dir, aside)  # atomic claim: one recoverer wins
-        except FileNotFoundError:
-            return  # someone else recovered it first
-        aside_meta = self._read_meta(aside)
-        if (aside_meta or {}).get("token") != judged_token:
-            # Fresh instance appeared in between: restore it, never evict.
-            try:
-                os.rename(aside, self._dir)
-            except OSError:
-                self._audit.append({"event": "mutation_mutex_restore_failed",
-                                    "aside": str(aside)})
-            return
-        self._remove(aside)
-
-    @staticmethod
-    def _read_meta(mutex_dir: Path) -> dict | None:
-        try:
-            return json.loads((mutex_dir / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-
-    @staticmethod
-    def _remove(mutex_dir: Path) -> None:
-        try:
-            (mutex_dir / "meta.json").unlink()
-        except OSError:
-            pass
-        try:
-            os.rmdir(mutex_dir)
-        except OSError:
-            pass
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+            self._fd = None
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True

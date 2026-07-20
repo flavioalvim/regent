@@ -7,15 +7,17 @@ changed (REQ-003 — the executor is the ONLY turn holder; no dual identity).
 
 Structure (closes the race-window family found in the build reviews): ALL
 lifecycle operations — acquire, heartbeat, release, takeover — run under a
-dedicated LIFECYCLE MUTEX (the same hardened primitive as the control
-mutation mutex: instance tokens, dead-pid-only eviction, audited recovery).
-Serialization makes each operation's read-judge-act sequence atomic with
-respect to the others: no verify-then-rename TOCTOU, no transiently-free
-path for a third acquirer, no double fence rotation.
+dedicated LIFECYCLE MUTEX backed by a kernel flock (single-host v0: atomic
+acquisition, automatic release on holder death, no stale-judgment/eviction
+code to race on). Serialization makes each operation's read-judge-act
+sequence atomic with respect to the others: no verify-then-rename TOCTOU, no
+transiently-free path for a third acquirer, no double fence rotation.
 
 The lock instance itself is created by an atomic rename of a PRE-POPULATED
 staging dir (owner.json written before the instance becomes visible), so an
-ownerless lock can only be a legacy crash artifact.
+ownerless lock can only be a legacy crash artifact. acquire() REFUSES any
+existing lock dir — ownerless included: evicting one is takeover's job
+(graced, audited), never a silent side effect of rename-over-empty-dir.
 
 Lock-ordering discipline (documented, deadlock-free): lifecycle mutex →
 control mutation mutex (takeover rotates control while holding the lifecycle
@@ -44,7 +46,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .audit import AuditLog, utcnow
-from .control import NotLockOwner, _MutationMutex
+from .control import NotLockOwner, _FlockMutex
 
 if TYPE_CHECKING:  # pragma: no cover
     from .control import ControlStore
@@ -72,9 +74,9 @@ class TurnLock:
     def path(self) -> Path:
         return self._dir
 
-    def _lifecycle_mutex(self) -> _MutationMutex:
-        mutex_dir = self._dir.with_name("turn.lifecycle.lock.d")
-        return _MutationMutex(mutex_dir, self._audit, self._lifecycle_timeout)
+    def _lifecycle_mutex(self) -> _FlockMutex:
+        mutex_file = self._dir.with_name("turn.lifecycle.lock")
+        return _FlockMutex(mutex_file, self._lifecycle_timeout)
 
     # -- lifecycle operations (each fully serialized) ----------------------
 
@@ -109,7 +111,11 @@ class TurnLock:
                 "new_token": new_token,
             })
             if status["state"] == "suspect":
-                _remove_tree(self._dir)  # serialized: the judged instance, no other
+                # STRICT removal BEFORE any fence rotation: if the old instance
+                # cannot be fully removed (permissions, I/O), the takeover
+                # aborts here — the control is never rotated away from a lock
+                # that still physically exists.
+                _remove_tree_strict(self._dir)
             # FENCE BEFORE HANDOVER: rotate the control token while no lock
             # instance exists. A crash here leaves the control fenced to a token
             # whose lock does not exist — safe (no usurpation; a later takeover
@@ -127,6 +133,12 @@ class TurnLock:
     # -- serialized internals ---------------------------------------------
 
     def _acquire_locked(self, token: str) -> str:
+        # POSIX rename may REPLACE an empty target dir, so an existence check
+        # comes first: any existing lock dir — ownerless included — refuses a
+        # plain acquire (eviction is takeover's graced, audited job). Safe
+        # because every lifecycle operation is serialized under the flock.
+        if self._dir.exists():
+            raise LockHeld(f"turn lock held: {self._dir}")
         # Atomic publication of a PRE-POPULATED instance: staging dir with
         # owner.json, then one rename. No mkdir→owner window exists.
         staging = self._dir.with_name(f"turn.lock.staging-{token}")
@@ -206,8 +218,15 @@ class TurnLock:
 
 def _remove_tree(path: Path) -> None:
     try:
-        for child in path.iterdir():
-            child.unlink()
-        path.rmdir()
+        _remove_tree_strict(path)
     except OSError:
         pass
+
+
+def _remove_tree_strict(path: Path) -> None:
+    """Removes the lock dir or RAISES — and verifies it is actually gone."""
+    for child in path.iterdir():
+        child.unlink()
+    path.rmdir()
+    if path.exists():  # paranoid post-condition; cheap
+        raise OSError(f"failed to remove {path}")
