@@ -120,6 +120,10 @@ class ControlStore:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def audit(self) -> AuditLog:
+        return self._audit
+
     def seed(self) -> dict[str, Any]:
         """Creates the initial control file (refuses to overwrite)."""
         if self._path.exists():
