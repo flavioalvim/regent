@@ -1,0 +1,11 @@
+{
+  "_comment": "sha256 of every KNOWN released version of each seeded template (legacy first, current last). regent init upgrades files whose hash is listed here atomically; unknown content is a conflict and is preserved. Regenerate entries with scripts/update-manifest.py at release time.",
+  "skills/regent/SKILL.md": [
+    "abaf22e8320184fee0bd8c0b617d3266fff18a5da95353ec669b0f5d5f93143d",
+    "a8b8075e8225440c61e9a5bc00f97d120f3b786e1ca70bca81337990d8e0d788"
+  ],
+  "skills/regent-stop/SKILL.md": [
+    "1a5a91a3c8be022e94fbdb31c586bf60591ba9f677b4b1cc9c90c3a3d2a88bb8",
+    "0c2149e4253b5ccebd4d923b61c19515a6aa7e2b1be554ec02f05c1cda2a2fe9"
+  ]
+}

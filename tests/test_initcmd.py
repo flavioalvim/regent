@@ -33,6 +33,7 @@ class InitTest(unittest.TestCase):
             self.assertTrue((link / "SKILL.md").is_file())  # symlink resolves
         self.assertTrue((self.root / ".regent" / "brainstorm" / "rounds").is_dir())
         self.assertTrue((self.root / ".regent" / "plans").is_dir())
+        self.assertTrue((self.root / ".regent" / "control.json").is_file())
 
     def test_rerun_is_noop(self):
         self.assertEqual(self._init()[0], EXIT_OK)

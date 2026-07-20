@@ -44,4 +44,22 @@ def run_doctor(project_root: Path, out=sys.stdout, probe=_default_probe) -> int:
     print(f"project   {'INITIALIZED' if initialized else 'NOT-INITIALIZED':<8} "
           f"{project_root}", file=out)
 
+    control_state = _control_state(project_root)
+    print(f"control   {control_state.upper():<8}", file=out)
+    if control_state == "corrupt":  # PLAN-002: corrupt control fails the doctor
+        all_ok = False
+
     return EXIT_OK if all_ok else EXIT_UNAVAILABLE
+
+
+def _control_state(project_root: Path) -> str:
+    path = project_root / ".regent" / "control.json"
+    if not path.exists():
+        return "uninitialized"
+    from .protocol.audit import AuditLog
+    from .protocol.control import ControlSchemaError, ControlStore
+    try:
+        ControlStore(path, AuditLog(path.parent / "protocol" / "audit.jsonl")).load()
+        return "initialized"
+    except ControlSchemaError:
+        return "corrupt"

@@ -1,14 +1,22 @@
 """regent init — seed .regent/ and managed integrations into a host project.
 
-Contract (PRD REQ-003 §6, REQ-004): installation is atomic — exit 0 only on
-complete seeding; any failure rolls back every path this run created, leaving
-no partial state. A missing agent CLI is a warning, never an init failure.
-Pre-existing content that diverges from what would be seeded is a conflict:
-nothing is touched. Re-running over an identical installation is a no-op.
+Contract (PRD REQ-003 §6, REQ-004; PLAN-002 STEP-03): installation is atomic —
+exit 0 only on complete seeding; any failure rolls back every path this run
+created OR OVERWROTE (originals restored), leaving no partial state. A missing
+agent CLI is a warning, never an init failure.
+
+Upgrade protocol (PLAN-002): templates/MANIFEST.json lists the sha256 of every
+KNOWN released version of each seeded template. Existing content whose hash is
+listed is UPGRADED atomically to the current template; unknown content is a
+conflict and is preserved untouched. `.regent/control.json` is seeded when
+absent; a present-and-valid control (any evolved version) is a no-op; a corrupt
+control is a conflict.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 import sys
 from importlib import resources
@@ -22,19 +30,19 @@ EXIT_CONFLICT = 2
 EXIT_FAILURE = 1
 
 
-class SeedConflict(Exception):
-    """Pre-existing host content diverges from what init would seed."""
-
-
 def _template_skill(name: str) -> str:
     ref = resources.files("regent").joinpath(f"templates/skills/{name}/SKILL.md")
     return ref.read_text(encoding="utf-8")
 
 
-def _plan(project_root: Path) -> list[tuple[str, Path, str]]:
-    """Returns [(kind, path, payload)] where kind is 'file' or 'symlink'.
+def _manifest() -> dict:
+    ref = resources.files("regent").joinpath("templates/MANIFEST.json")
+    return json.loads(ref.read_text(encoding="utf-8"))
 
-    payload = file content, or the symlink target (relative)."""
+
+def _plan(project_root: Path) -> list[tuple[str, Path, str]]:
+    """[(kind, path, payload)]: kind ∈ file|symlink|control; payload = content,
+    symlink target, or manifest key (for files under the manifest)."""
     plan: list[tuple[str, Path, str]] = []
     for name in SKILL_NAMES:
         plan.append(("file", project_root / ".regent" / "skills" / name / "SKILL.md",
@@ -43,20 +51,45 @@ def _plan(project_root: Path) -> list[tuple[str, Path, str]]:
                      f"../../.regent/skills/{name}"))
     plan.append(("file", project_root / ".regent" / "brainstorm" / "rounds" / ".gitkeep", ""))
     plan.append(("file", project_root / ".regent" / "plans" / ".gitkeep", ""))
+    plan.append(("control", project_root / ".regent" / "control.json", ""))
     return plan
 
 
-def _existing_state(kind: str, path: Path, payload: str) -> str:
-    """'absent' | 'identical' | 'divergent' for one planned entry."""
+def _manifest_key(project_root: Path, path: Path) -> str | None:
+    try:
+        rel = path.relative_to(project_root / ".regent")
+    except ValueError:
+        return None
+    return str(rel)
+
+
+def _existing_state(kind: str, path: Path, payload: str,
+                    known_hashes: list[str]) -> str:
+    """'absent' | 'identical' | 'upgradeable' | 'divergent'."""
     if kind == "symlink":
         if not path.is_symlink():
             return "absent" if not path.exists() else "divergent"
         import os
         return "identical" if os.readlink(path) == payload else "divergent"
+    if kind == "control":
+        if not path.exists():
+            return "absent"
+        from .protocol.audit import AuditLog
+        from .protocol.control import ControlSchemaError, ControlStore
+        try:
+            ControlStore(path, AuditLog(path.parent / "protocol" / "audit.jsonl")).load()
+            return "identical"  # valid at ANY evolved version = no-op
+        except ControlSchemaError:
+            return "divergent"
     if not path.exists():
         return "absent"
-    if path.is_file() and path.read_text(encoding="utf-8") == payload:
+    if not path.is_file():
+        return "divergent"
+    content = path.read_bytes()
+    if content.decode("utf-8", errors="replace") == payload:
         return "identical"
+    if hashlib.sha256(content).hexdigest() in known_hashes:
+        return "upgradeable"  # known released version → atomic upgrade
     return "divergent"
 
 
@@ -64,48 +97,68 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
     project_root = project_root.resolve()
     try:
         plan = _plan(project_root)
-    except (FileNotFoundError, ModuleNotFoundError) as exc:
+        manifest = _manifest()
+    except (FileNotFoundError, ModuleNotFoundError, json.JSONDecodeError) as exc:
         print(f"error: packaged templates unavailable: {exc}", file=out)
         return EXIT_FAILURE
 
-    states = {path: _existing_state(kind, path, payload) for kind, path, payload in plan}
+    states = {}
+    for kind, path, payload in plan:
+        key = _manifest_key(project_root, path)
+        known = manifest.get(key, []) if key else []
+        states[path] = _existing_state(kind, path, payload, known)
+
     divergent = [p for p, s in states.items() if s == "divergent"]
     if divergent:
-        print("error: conflict — pre-existing content differs from what regent would seed:",
-              file=out)
+        print("error: conflict — pre-existing content differs from every known "
+              "regent version:", file=out)
         for p in divergent:
             print(f"  {p.relative_to(project_root)}", file=out)
         print("nothing was changed. Resolve the conflicts and re-run.", file=out)
         return EXIT_CONFLICT
 
     todo = [(kind, path, payload) for kind, path, payload in plan
-            if states[path] == "absent"]
+            if states[path] in ("absent", "upgradeable")]
     if not todo:
         print("already initialized — nothing to do.", file=out)
         _warn_missing_clis(out)
         return EXIT_OK
 
     created: list[Path] = []
+    replaced: list[tuple[Path, bytes]] = []
     try:
         for kind, path, payload in todo:
             for parent in _missing_parents(path):
                 parent.mkdir()
                 created.append(parent)
             if kind == "file":
-                path.write_text(payload, encoding="utf-8")
-            else:
+                if states[path] == "upgradeable":
+                    replaced.append((path, path.read_bytes()))
+                    path.write_text(payload, encoding="utf-8")
+                else:
+                    path.write_text(payload, encoding="utf-8")
+                    created.append(path)
+            elif kind == "symlink":
                 path.symlink_to(payload)
-            created.append(path)
+                created.append(path)
+            else:  # control
+                from .protocol.audit import AuditLog
+                from .protocol.control import ControlStore
+                ControlStore(path, AuditLog(path.parent / "protocol" / "audit.jsonl")
+                             ).seed()
+                created.append(path)
     except OSError as exc:
-        _rollback(created)
+        _rollback(created, replaced)
         print(f"error: seeding failed ({exc}); all changes rolled back.", file=out)
         return EXIT_FAILURE
 
     for kind, path, _ in todo:
-        print(f"seeded {path.relative_to(project_root)}"
+        verb = "upgraded" if states[path] == "upgradeable" else "seeded"
+        print(f"{verb} {path.relative_to(project_root)}"
               + (" (symlink)" if kind == "symlink" else ""), file=out)
     _warn_missing_clis(out)
-    print("regent initialized. Open a Claude Code session here and use /regent.", file=out)
+    print("regent initialized. Open a Claude Code session here and use /regent.",
+          file=out)
     return EXIT_OK
 
 
@@ -118,7 +171,12 @@ def _missing_parents(path: Path) -> list[Path]:
     return list(reversed(missing))
 
 
-def _rollback(created: list[Path]) -> None:
+def _rollback(created: list[Path], replaced: list[tuple[Path, bytes]]) -> None:
+    for path, original in replaced:
+        try:
+            path.write_bytes(original)
+        except OSError:
+            pass
     for path in reversed(created):
         try:
             if path.is_symlink() or path.is_file():
