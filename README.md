@@ -26,8 +26,13 @@ regent doctor                      # checks executor (claude) and advisor (codex
 ```
 
 Then open a Claude Code session in the project — `/regent` and `/regent-stop` are available
-(`/regent brainstorm "<question>"` opens the first round). v0 capability is file-driven
-(rounds under `.regent/brainstorm/rodadas/`); the advisor requires the `codex` CLI.
+(`/regent brainstorm "<question>"` opens the first round). The v1 skills are
+**control-backed**: activity state lives in `.regent/control.json` and is driven through
+the JSON subcommands — `regent status` (control + lock + the executable control×files
+matrix as `workspace.verdict`), `regent activity
+start|resume|suspend|conclude|heartbeat|takeover`, `regent stop request|check`. Hosts
+seeded by older versions upgrade automatically on `regent init` (known-version manifest;
+unknown local edits are preserved as conflicts). The advisor requires the `codex` CLI.
 
 Development: `PYTHONPATH=src python3 -m unittest discover -s tests`; packaging gate:
 `bash scripts/gate-package.sh`. Canonical skill content lives in `src/regent/templates/`

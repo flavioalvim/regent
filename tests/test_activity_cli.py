@@ -162,5 +162,11 @@ class ActivityCliTest(unittest.TestCase):
         self.assertIn("turn_lock_takeover", events)
 
 
+class VersionTest(unittest.TestCase):
+    def test_cli_version_reports_040(self):
+        import regent
+        self.assertEqual(regent.__version__, "0.4.0")
+
+
 if __name__ == "__main__":
     unittest.main()

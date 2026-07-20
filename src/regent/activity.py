@@ -358,6 +358,26 @@ WORKSPACE_VERDICTS = (
 )
 
 
+def explain_control_diff(before: dict, after: dict) -> dict:
+    """Attributability check for the exempted operational files (PLAN-002
+    commit choreography): classifies control.json changes between a step-start
+    snapshot and commit time. `version`/`updated_at` churn and an ARRIVING
+    stop_request are explained operational mutations (the latter belongs to the
+    NEXT operational commit); any change to the activity object or to
+    last_concluded that the current operation did not perform is unexplained —
+    default-deny, the step commit must fail."""
+    explained, unexplained = [], []
+    for key in ("version", "updated_at"):
+        if before.get(key) != after.get(key):
+            explained.append(key)
+    if before.get("stop_request") != after.get("stop_request"):
+        explained.append("stop_request")
+    for key in ("activity", "last_concluded"):
+        if before.get(key) != after.get(key):
+            unexplained.append(key)
+    return {"explained": explained, "unexplained": unexplained}
+
+
 def classify_workspace(activity: dict | None, open_artifacts: list[str],
                        root: Path) -> str:
     """The PLAN-002 control×files matrix, row by row (default-deny)."""
