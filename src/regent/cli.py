@@ -1,18 +1,18 @@
-"""regent CLI entry point: init and doctor subcommands."""
+"""regent CLI entry point: init, doctor, status, activity and stop subcommands."""
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 from . import __version__
+from .activity_cli import _JsonArgumentParser, _UsageError, _fail, build_parser, run
 from .doctor import run_doctor
 from .initcmd import run_init
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _JsonArgumentParser(
         prog="regent",
         description="Autonomous conduction and mediated adversarial deliberation "
                     "between AI agents, pluggable into any project.")
@@ -25,11 +25,21 @@ def main(argv: list[str] | None = None) -> int:
     p_doctor = sub.add_parser("doctor", help="diagnose agent CLI capabilities")
     p_doctor.add_argument("--project", default=".", help="host project root (default: cwd)")
 
-    args = parser.parse_args(argv)
-    root = Path(args.project)
+    build_parser(sub)  # status / activity / stop (JSON contract)
+
+    try:
+        args = parser.parse_args(argv)
+    except _UsageError as exc:
+        return _fail("USAGE", str(exc))
+
     if args.command == "init":
-        return run_init(root)
-    return run_doctor(root)
+        return run_init(Path(args.project))
+    if args.command == "doctor":
+        return run_doctor(Path(args.project))
+    try:
+        return run(args)
+    except _UsageError as exc:
+        return _fail("USAGE", str(exc))
 
 
 def entrypoint() -> None:
