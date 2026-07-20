@@ -31,7 +31,8 @@ class InitTest(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertEqual(os.readlink(link), f"../../.regent/skills/{name}")
             self.assertTrue((link / "SKILL.md").is_file())  # symlink resolves
-        self.assertTrue((self.root / ".regent" / "brainstorm" / "rodadas").is_dir())
+        self.assertTrue((self.root / ".regent" / "brainstorm" / "rounds").is_dir())
+        self.assertTrue((self.root / ".regent" / "plans").is_dir())
 
     def test_rerun_is_noop(self):
         self.assertEqual(self._init()[0], EXIT_OK)

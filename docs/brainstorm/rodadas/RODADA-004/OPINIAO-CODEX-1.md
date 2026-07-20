@@ -1,0 +1,19 @@
+A direção é boa: separação `plan`/`build`, aprovação obrigatória, gates reais, revisão final e declaração honesta das limitações v0. Porém, o desenho ainda tem lacunas bloqueantes:
+
+1. **O registro do hash é circularmente impossível.** `STEP-NN.md` deve conter o hash do mesmo commit que inclui esse arquivo. Ao inserir o hash, o conteúdo muda e gera outro hash. É necessário um protocolo em duas fases — por exemplo, commit da etapa identificado por trailer/mensagem e registro posterior em um ledger — ou remover o hash do artefato incluído naquele commit.
+
+2. **A política de commit contradiz o requisito vigente.** O [PRD](/home/flavio/projetos/regent/docs/PRD.md:135) determina normativamente commits apenas de paths regent-owned. A proposta chama isso de política “do brainstorm”, mas ela está em REQ-004 e abrange os comandos. REQ-005 não pode simplesmente coexistir em contradição: deve alterar explicitamente o escopo de REQ-004 §6, separando commits operacionais/suspensão de commits deliberados do `build`.
+
+3. **Falta proteção contra incorporar alterações preexistentes do usuário.** “Paths tocados pela etapa” não basta: se um arquivo já estiver modificado, o commit capturará também mudanças alheias. O build precisa registrar SHA-base e estado inicial, detectar dirty worktree e sobreposição, fazer staging explícito, inspecionar o diff staged e falhar por padrão diante de alterações não atribuíveis. Esse SHA-base também deve definir precisamente o “diff integral” enviado ao advisor.
+
+4. **O ciclo de vida dos planos fica bloqueável.** Um plano aprovado e não iniciado deixa de ser atividade aberta, mas permanece candidato a `/regent build` indefinidamente. Dois desses planos tornam todo build impossível, e não existe seleção, rejeição, cancelamento ou arquivamento. Deve haver decisão terminal estruturada (`APPROVED`, `REJECTED`, `CANCELLED`) e seleção explícita como `/regent build PLAN-NNN`, ou uma regra equivalente que mantenha um único candidato e permita descartá-lo.
+
+5. **`CONCLUSION.md` colapsa resultados incompatíveis.** Pela regra baseada apenas na presença do arquivo, um build aceito e um build com parecer adverso e pendências ficam igualmente “concluídos”. É necessário registrar estado terminal explícito e ator da decisão. Achados corrigidos após a revisão devem invalidar aquela revisão e exigir novo gate relevante e nova consulta; resultado não-`SUCCESS` ou divergência não arbitrada não pode avançar como aceite.
+
+6. **As consultas não satisfazem a evidência exigida por REQ-003 §5.** Um arquivo com o parecer “pela mesma invocação” não define persistência de prompt completo, resposta/saída parcial, exit code, timestamp, vínculo com plano/build nem os resultados `SUCCESS`, `TIMEOUT`, `FAILURE` e `CANCELLED`. O v0 pode ser file-driven, mas continua obrigado a falhar fechado e a registrar essa tupla em toda consulta.
+
+7. **Retomada por “última etapa completa” é insuficiente.** Há estados intermediários materialmente distintos: implementação suja antes do gate, gate vermelho, gate verde antes do commit, commit realizado antes do registro e revisão final interrompida. A skill precisa definir artefatos/fases e regras idempotentes de recuperação para cada fronteira; do contrário pode repetir commit, perder associação de evidência ou tratar código não validado como continuação normal.
+
+8. **A migração dos nomes PT→EN não tem protocolo de compatibilidade.** Hosts v0 existentes podem conter `RODADA-*` e artefatos portugueses. Se a nova detecção enxergar apenas `ROUND-*`, poderá declarar estado vazio e abrir atividade concorrente. A mudança precisa detectar ambos os esquemas e realizar migração idempotente/atômica, ou parar com instrução explícita; coexistência deve ser corrupção default-deny. A exceção dogfood em `docs/brainstorm/` deve permanecer delimitada pelo local, não por heurística ambígua.
+
+DISCORDA

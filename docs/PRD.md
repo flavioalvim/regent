@@ -135,11 +135,60 @@ opinions; residuals 3 and 5 conceded and defined by Claude).*
 6. **Commit policy.** Durable evidence persistence under `.regent/` is the requirement;
    git commit is a distinct, non-blocking step covering ONLY regent-owned paths (`.regent/`
    + marked integrations), never unrelated host content. A failed commit never prevents
-   suspension; it is reported and left pending.
+   suspension; it is reported and left pending. *(Amended by REQ-005 §5: this rule governs
+   **operational commits** — brainstorm, suspension, control artifacts. Deliberate build-step
+   commits are a distinct category defined there.)*
 7. **v0 (file-driven) dogfood.** Until extraction lands, the two skills operate at a
    declared reduced capability level: state = brainstorm round files (open round = round dir
    without `DECISAO.md`), stop = `SUSPENSAO.md` marker + commit, no daemon/lock/abort. The
    skills MUST state their capability level and never claim semantics that do not exist yet.
+
+### REQ-005 — `plan` and `build` modes (v0 file-driven)
+
+*Source: RODADA-004 (owner requirement; Codex objections 1–8 incorporated).*
+
+1. **Plan mode.** `/regent plan "<goal>"` creates `.regent/plans/PLAN-NNN/` and deliberates
+   a plan like a round: `REQUEST.md` (owner's goal verbatim) → `PLAN.md` (goal, scope in/out,
+   numbered steps each with an acceptance criterion and an executable gate command, risks;
+   content in the host's native language) → advisor review with one rebuttal cycle →
+   `APPROVAL.md` with structured `status: APPROVED | REJECTED | CANCELLED` + actor. Without
+   APPROVED status a plan is not executable; the owner may cancel a plan at any time.
+2. **Build candidacy and selection.** A build candidate is an APPROVED plan without a
+   concluded build. Bare `/regent build` works only with exactly one candidate; more than
+   one demands explicit `/regent build PLAN-NNN`; none is an error. An approved-but-unstarted
+   plan is NOT an open activity (it awaits the owner's explicit build order).
+3. **Build step protocol.** `build/BASELINE.md` records the base SHA on build start; per
+   step: clean-worktree precondition (dirty = stop, default-deny — never absorb pre-existing
+   user changes) → implement → run the step's gate for real (red gate never proceeds and
+   never commits) → write `build/STEP-NN.md` (step base SHA, files touched, gate output — no
+   commit hash: the artifact↔commit link is the commit-message trailer
+   `Regent-Step: PLAN-NNN/STEP-NN`, avoiding hash circularity) → deliberate commit with
+   file-by-file staging of only step-attributable paths, staged-diff inspection, and failure
+   without commit on anything unattributable.
+4. **Resume phases.** Observable per-step phases with idempotent recovery — IMPLEMENTING
+   (re-run gate before trusting anything), GATE-RED (back to implementation),
+   GATE-GREEN-UNCOMMITTED (re-verify gate, then commit; trailer check before committing
+   prevents duplicates), COMMITTED (advance). Recovery always consults trailer → STEP file →
+   worktree, in that order.
+5. **Commit categories (amends REQ-004 §6).** Operational commits (brainstorm, suspension,
+   control artifacts) cover only regent-owned paths. **Deliberate build-step commits** are a
+   distinct category: they include host paths attributable to the step plus the step's
+   regent artifacts, under the §3 attribution protocol.
+6. **Build conclusion.** Final advisor review over exactly `BASE-SHA..HEAD`, then
+   `build/CONCLUSION.md` with structured `status: ACCEPTED | ACCEPTED-WITH-RESERVATIONS |
+   REJECTED` + actor + pending items. An adverse review or non-arbitrated divergence can
+   never become acceptance; any post-review fix invalidates the review (re-run affected gate
+   + new advisor consultation before concluding).
+7. **Consultation evidence (applies to all modes).** Every advisor consultation persists the
+   REQ-003 §5 tuple: full prompt in a `*-PROMPT.md` sibling, response artifact opening with
+   a structured header (`outcome`, `exit_code`, `timestamp`, `linkage`). Fail-closed on
+   non-SUCCESS outcomes.
+8. **Artifact naming (REQ-002 alignment).** New hosts use English artifact names for all
+   modes (`rounds/ROUND-NNN/QUESTION.md`, `DECISION.md`, …). Legacy hosts (pre-0.2 PT-named
+   seeds) keep operating on their PT scheme for brainstorm, recognized by fixed location;
+   `plan`/`build` always use the English scheme. Both schemes present and non-empty in one
+   host = corrupted state (default-deny, manual migration instructions; never auto-migrate).
+   The regent repo's own `docs/brainstorm/` remains the location-delimited dogfood exception.
 
 ## Requirement log
 
@@ -149,3 +198,4 @@ opinions; residuals 3 and 5 conceded and defined by Claude).*
 | REQ-002 | Three-layer language policy | RODADA-001 | Accepted (consensus + owner) |
 | REQ-003 | Agent roles and execution runtime | RODADA-002 | Accepted (consensus) |
 | REQ-004 | Activity control commands `/regent`, `/regent-stop` | RODADA-003 | Accepted (consensus) |
+| REQ-005 | `plan` and `build` modes (v0 file-driven) | RODADA-004 | Accepted (consensus) |

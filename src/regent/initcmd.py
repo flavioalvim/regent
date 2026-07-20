@@ -41,7 +41,8 @@ def _plan(project_root: Path) -> list[tuple[str, Path, str]]:
                      _template_skill(name)))
         plan.append(("symlink", project_root / ".claude" / "skills" / name,
                      f"../../.regent/skills/{name}"))
-    plan.append(("file", project_root / ".regent" / "brainstorm" / "rodadas" / ".gitkeep", ""))
+    plan.append(("file", project_root / ".regent" / "brainstorm" / "rounds" / ".gitkeep", ""))
+    plan.append(("file", project_root / ".regent" / "plans" / ".gitkeep", ""))
     return plan
 
 
