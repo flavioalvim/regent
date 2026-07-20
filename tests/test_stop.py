@@ -61,7 +61,7 @@ class StopRequestTest(unittest.TestCase):
         events = [r for r in self.audit.read_all() if r["event"] == "stop_request_discarded"]
         self.assertEqual(len(events), 1)
 
-    def test_suspend_requires_full_payload_and_token(self):
+    def test_suspend_requires_full_payload(self):
         with self.assertRaises(NotLockOwner):
             suspend_activity(self.store, turn_token="wrong-token",
                              checkpoint="STEP-02", reason="owner asked")
@@ -79,12 +79,22 @@ class StopRequestTest(unittest.TestCase):
         self.assertEqual(suspension["owning_turn"], TOKEN)
 
     def test_transitions_idempotent(self):
-        record_stop_request(self.store, turn_token=TOKEN)
+        first = record_stop_request(self.store, turn_token=TOKEN)
+        version_after_record = self.store.load()["version"]
+        again = record_stop_request(self.store, turn_token=TOKEN)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(self.store.load()["version"], version_after_record)  # true no-op
+
         self.assertTrue(suspend_activity(self.store, turn_token=TOKEN,
                                          checkpoint="STEP-02", reason="stop"))
         self.assertIsNone(self.store.load()["stop_request"])  # consumed
+        version_after_suspend = self.store.load()["version"]
         self.assertFalse(suspend_activity(self.store, turn_token=TOKEN,
                                           checkpoint="STEP-02", reason="stop"))
+        self.assertEqual(self.store.load()["version"], version_after_suspend)  # true no-op
+        with self.assertRaises(NotLockOwner):  # re-apply demands the suspending turn
+            suspend_activity(self.store, turn_token="another-token",
+                             checkpoint="STEP-02", reason="stop")
         self.assertEqual(self.store.load()["activity"]["state"], "SUSPENDED")
 
     def _rotate_turn(self, new_token):

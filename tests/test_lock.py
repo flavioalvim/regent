@@ -9,9 +9,8 @@ import unittest
 from pathlib import Path
 
 from regent.protocol.audit import AuditLog
-from regent.protocol.control import (ControlStore, NotLockOwner as ControlTokenMismatch,
-                                     initial_control)
-from regent.protocol.lock import LockHeld, NotLockOwner, StaleLock, TurnLock
+from regent.protocol.control import ControlStore, NotLockOwner, initial_control
+from regent.protocol.lock import LockHeld, StaleLock, TurnLock
 
 
 def _takeover_candidate(state_dir: str, audit_path: str, barrier, queue) -> None:
@@ -112,23 +111,49 @@ class TurnLockTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), content)
 
     def test_control_op_with_divergent_token_rejected_after_takeover(self):
+        # Control EXISTS FIRST with the old token; takeover(control_store=...)
+        # must rotate it in the same operation (end-to-end fencing).
         stale = TurnLock(self.state, self.audit, stale_after=0.0)
         old_token = stale.acquire()
-        time.sleep(0.01)
-        new_token = stale.takeover(actor="mediator", reason="stale")
-
         store = ControlStore(Path(self._tmp.name) / "control.json", self.audit)
         store.seed()
         body = initial_control()
         body["activity"] = {"type": "build", "id": "PLAN-001", "epoch": 1,
                             "state": "ACTIVE", "suspension": None,
-                            "turn": {"owner": "executor", "token": new_token,
+                            "turn": {"owner": "executor", "token": old_token,
                                      "acquired_at": "2026-01-01T00:00:00+00:00"}}
         store.cas_write(0, body)
+        time.sleep(0.01)
 
-        with self.assertRaises(ControlTokenMismatch):  # previous holder is fenced out
-            store.cas_write(1, body, turn_token=old_token)
-        store.cas_write(1, dict(store.load()), turn_token=new_token)
+        new_token = stale.takeover(actor="mediator", reason="stale",
+                                   control_store=store)
+        control = store.load()
+        self.assertEqual(control["activity"]["turn"]["token"], new_token)
+
+        with self.assertRaises(NotLockOwner):  # previous holder is fenced out
+            store.cas_write(control["version"], dict(control), turn_token=old_token)
+        store.cas_write(control["version"], dict(control), turn_token=new_token)
+
+    def test_heartbeat_old_token_after_takeover_does_not_usurp(self):
+        stale = TurnLock(self.state, self.audit, stale_after=0.0)
+        old_token = stale.acquire()
+        time.sleep(0.01)
+        new_token = stale.takeover(actor="mediator", reason="stale")
+        with self.assertRaises((NotLockOwner, StaleLock)):
+            stale.heartbeat(old_token)
+        owner = json.loads((stale.path / "owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(owner["token"], new_token)  # new holder untouched
+
+    def test_release_old_token_after_takeover_preserves_new_lock(self):
+        stale = TurnLock(self.state, self.audit, stale_after=0.0)
+        old_token = stale.acquire()
+        time.sleep(0.01)
+        new_token = stale.takeover(actor="mediator", reason="stale")
+        with self.assertRaises((NotLockOwner, StaleLock)):
+            stale.release(old_token)
+        owner = json.loads((stale.path / "owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(owner["token"], new_token)  # lock NOT destroyed
+        stale.release(new_token)  # rightful owner still can release
 
 
 if __name__ == "__main__":

@@ -132,12 +132,31 @@ class ControlStoreTest(unittest.TestCase):
         mutex = self.root / "control.json.lock.d"
         mutex.mkdir()
         (mutex / "meta.json").write_text(
-            json.dumps({"pid": 99999999, "at": "2026-01-01T00:00:00+00:00"}),
+            json.dumps({"pid": 99999999, "at": "2026-01-01T00:00:00+00:00",
+                        "token": "dead-holder"}),
             encoding="utf-8")
         control = self.store.mutate(lambda body: body)
         self.assertEqual(control["version"], 1)
         events = [r["event"] for r in AuditLog(self.root / "audit.jsonl").read_all()]
         self.assertIn("mutation_mutex_recovered", events)
+
+    def test_mutation_mutex_alive_holder_never_evicted(self):
+        mutex = self.root / "control.json.lock.d"
+        mutex.mkdir()
+        (mutex / "meta.json").write_text(  # ALIVE pid with an ancient timestamp
+            json.dumps({"pid": os.getpid(), "at": "2020-01-01T00:00:00+00:00",
+                        "token": "alive-holder"}),
+            encoding="utf-8")
+        impatient = ControlStore(self.root / "control.json",
+                                 AuditLog(self.root / "audit.jsonl"),
+                                 mutation_timeout=0.2)
+        from regent.protocol.control import MutationMutexBusy
+        with self.assertRaises((MutationMutexBusy, VersionConflict)):
+            impatient.mutate(lambda body: body, retries=1)
+        self.assertEqual(self.store.load()["version"], 0)  # nothing was published
+        self.assertTrue((mutex / "meta.json").exists())  # holder NOT evicted
+        events = [r["event"] for r in AuditLog(self.root / "audit.jsonl").read_all()]
+        self.assertNotIn("mutation_mutex_recovered", events)
 
     def test_orphan_tempfiles_cleaned(self):
         orphan = self.root / ".control-tmp-deadbeef"

@@ -1,5 +1,6 @@
 # PLAN-001 / STEP-02 — Turn lock do executor
 
+step_base_sha: 01d4c99 (commit do STEP-01)
 files_touched:
   - src/regent/protocol/lock.py (novo)
   - tests/test_lock.py (novo, 9 testes dirigidos)

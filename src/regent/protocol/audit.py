@@ -29,14 +29,21 @@ class AuditLog:
     def append(self, record: dict) -> None:
         entry = dict(record)
         entry.setdefault("at", utcnow())
-        line = json.dumps(entry, sort_keys=True) + "\n"
+        payload = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
-            os.write(fd, line.encode("utf-8"))
+            written = 0
+            while written < len(payload):  # os.write may be partial
+                written += os.write(fd, payload[written:])
             os.fsync(fd)
         finally:
             os.close(fd)
+        dir_fd = os.open(self._path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)  # durability of the entry ON FIRST CREATION too
+        finally:
+            os.close(dir_fd)
 
     def read_all(self) -> list[dict]:
         if not self._path.exists():

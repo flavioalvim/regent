@@ -9,17 +9,23 @@ Contracts:
 - The lock lives in the DISPOSABLE local state dir (XDG side, REQ-001 §3);
   a successful acquire touches nothing else (P-01: `.regent/` and git stay
   byte-identical).
-- Ownership is a uuid4 token written to owner.json inside the lock dir;
-  release/heartbeat require the current token (else NotLockOwner).
+- Ownership is a uuid4 token in owner.json inside the lock dir.
+- heartbeat is INSTANCE-BOUND: it opens the lock directory once and performs
+  read-verify-write through that directory fd — if a takeover renames the
+  instance concurrently, the write lands in the renamed (discarded) dir and
+  can never usurp the new holder's lock.
+- release claims the instance by atomic rename, verifies the token INSIDE the
+  claimed instance, and only then deletes it; a mismatch restores the instance
+  (audited if restoration fails). The old holder can never destroy a lock it
+  no longer owns.
 - Takeover is only allowed on a SUSPECT lock (heartbeat older than
   stale_after, or ownerless beyond a grace covering the mkdir→owner.json
-  window). It is always explicit and audited (actor, reason, previous owner,
-  age, timestamps) to the SHAREABLE audit log under .regent/ (REQ-001 §3).
-- Takeover race: the stale dir is atomically renamed aside first — exactly
-  one candidate wins the rename; the loser gets LockHeld.
-- ABA fencing end-to-end: the winning token is what callers must mirror into
-  control.activity.turn.token; control operations guarded by turn_token then
-  reject the previous holder (control.assert_turn_token).
+  window). The takeover INTENT is audited before acting; the judged instance
+  is claimed by atomic rename and verified by token (ABA guard) — exactly one
+  candidate wins, and a fresh lock can never be evicted.
+- ABA fencing end-to-end: `takeover(..., control_store=...)` rotates the token
+  recorded in control.activity.turn.token in the same operation, so control
+  operations guarded by the previous token fail immediately after takeover.
 """
 
 from __future__ import annotations
@@ -29,16 +35,17 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .audit import AuditLog, utcnow
+from .control import NotLockOwner
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .control import ControlStore
 
 
 class LockHeld(RuntimeError):
     """The lock is held (acquire) or not suspect / lost race (takeover)."""
-
-
-class NotLockOwner(RuntimeError):
-    """Operation attempted with a token that does not own the lock."""
 
 
 class StaleLock(RuntimeError):
@@ -60,25 +67,56 @@ class TurnLock:
     # -- acquisition ------------------------------------------------------
 
     def acquire(self) -> str:
+        return self._acquire_with_token(uuid.uuid4().hex)
+
+    def _acquire_with_token(self, token: str) -> str:
         try:
             os.mkdir(self._dir)  # parent (state dir) must exist; XDG-only footprint
         except FileExistsError:
             raise LockHeld(f"turn lock held: {self._dir}") from None
-        token = uuid.uuid4().hex
-        self._write_owner(token, acquired_at=utcnow())
+        payload = {"owner": "executor", "token": token,
+                   "acquired_at": utcnow(), "heartbeat_at": utcnow()}
+        (self._dir / "owner.json").write_text(json.dumps(payload), encoding="utf-8")
         return token
 
     def heartbeat(self, token: str) -> None:
-        owner = self._owner_or_raise(token)
-        self._write_owner(token, acquired_at=owner["acquired_at"])
+        """Instance-bound: read-verify-write through the directory fd, immune to
+        a concurrent takeover renaming the canonical path."""
+        try:
+            dir_fd = os.open(self._dir, os.O_RDONLY)
+        except FileNotFoundError:
+            raise StaleLock("turn lock no longer exists (released or taken over)") from None
+        try:
+            owner = self._read_owner_fd(dir_fd)
+            if owner is None or owner.get("token") != token:
+                raise NotLockOwner("token does not own the turn lock")
+            owner["heartbeat_at"] = utcnow()
+            tmp_fd = os.open("owner.json.tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                             0o644, dir_fd=dir_fd)
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                json.dump(owner, handle)
+            os.replace("owner.json.tmp", "owner.json",
+                       src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
 
     def release(self, token: str) -> None:
-        self._owner_or_raise(token)
+        """Claims the instance by atomic rename before destroying anything: the
+        previous holder can never delete a lock that was taken over."""
+        aside = self._dir.with_name(f"turn.lock.releasing-{uuid.uuid4().hex}")
         try:
-            (self._dir / "owner.json").unlink()
-        except OSError:
-            pass
-        os.rmdir(self._dir)
+            os.rename(self._dir, aside)
+        except FileNotFoundError:
+            raise StaleLock("turn lock no longer exists (released or taken over)") from None
+        owner = self._read_owner_at(aside)
+        if owner is None or owner.get("token") != token:
+            try:
+                os.rename(aside, self._dir)
+            except OSError:
+                self._audit.append({"event": "turn_lock_release_restore_failed",
+                                    "aside": str(aside)})
+            raise NotLockOwner("token does not own the turn lock")
+        _remove_tree(aside)
 
     # -- inspection -------------------------------------------------------
 
@@ -86,10 +124,13 @@ class TurnLock:
         """{'state': 'free'|'held'|'suspect', 'age_seconds': float|None, ...}"""
         if not self._dir.exists():
             return {"state": "free", "age_seconds": None, "owner": None}
-        owner = self._read_owner()
+        owner = self._read_owner_at(self._dir)
         now = datetime.now(timezone.utc)
         if owner is None:
-            age = now.timestamp() - self._dir.stat().st_mtime
+            try:
+                age = now.timestamp() - self._dir.stat().st_mtime
+            except OSError:
+                return {"state": "free", "age_seconds": None, "owner": None}
             state = "suspect" if age > self._ownerless_grace else "held"
             return {"state": state, "age_seconds": age, "owner": None}
         beat = datetime.fromisoformat(owner["heartbeat_at"])
@@ -99,13 +140,22 @@ class TurnLock:
 
     # -- takeover ---------------------------------------------------------
 
-    def takeover(self, *, actor: str, reason: str) -> str:
+    def takeover(self, *, actor: str, reason: str,
+                 control_store: "ControlStore | None" = None) -> str:
         status = self.status()
         if status["state"] == "free":
             return self.acquire()
         if status["state"] != "suspect":
             raise LockHeld("takeover refused: lock is not suspect")
         judged_token = (status["owner"] or {}).get("token")
+        new_token = uuid.uuid4().hex
+        # Audit the INTENT first: any crash past this point leaves a record.
+        self._audit.append({
+            "event": "turn_lock_takeover", "actor": actor, "reason": reason,
+            "previous_owner": judged_token,
+            "age_seconds": round(status["age_seconds"] or 0, 3),
+            "new_token": new_token,
+        })
         aside = self._dir.with_name(f"turn.lock.stale-{uuid.uuid4().hex}")
         try:
             os.rename(self._dir, aside)  # atomic: exactly one candidate renames it
@@ -121,25 +171,39 @@ class TurnLock:
                 self._audit.append({"event": "turn_lock_takeover_restore_failed",
                                     "actor": actor, "aside": str(aside)})
             raise LockHeld("takeover lost: lock changed hands while judging it")
-        token = self.acquire()
-        self._audit.append({
-            "event": "turn_lock_takeover", "actor": actor, "reason": reason,
-            "previous_owner": (status["owner"] or {}).get("token"),
-            "age_seconds": round(status["age_seconds"] or 0, 3),
-            "new_token": token,
-        })
+        token = self._acquire_with_token(new_token)
         _remove_tree(aside)
+        if control_store is not None:
+            self._rotate_control_token(control_store, judged_token, token)
         return token
+
+    @staticmethod
+    def _rotate_control_token(store: "ControlStore", previous: str | None,
+                              token: str) -> None:
+        """End-to-end fencing: replace the evicted turn token in an ACTIVE
+        control activity so the previous holder is rejected immediately."""
+        def fn(body: dict) -> dict:
+            activity = body.get("activity")
+            turn = (activity or {}).get("turn")
+            if turn is not None and turn.get("token") == previous:
+                turn["token"] = token
+                turn["acquired_at"] = utcnow()
+            return body
+        store.mutate(fn)
 
     # -- internals --------------------------------------------------------
 
-    def _write_owner(self, token: str, *, acquired_at: str) -> None:
-        payload = {"owner": "executor", "token": token,
-                   "acquired_at": acquired_at, "heartbeat_at": utcnow()}
-        (self._dir / "owner.json").write_text(json.dumps(payload), encoding="utf-8")
-
-    def _read_owner(self) -> dict | None:
-        return self._read_owner_at(self._dir)
+    @staticmethod
+    def _read_owner_fd(dir_fd: int) -> dict | None:
+        try:
+            fd = os.open("owner.json", os.O_RDONLY, dir_fd=dir_fd)
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
 
     @staticmethod
     def _read_owner_at(lock_dir: Path) -> dict | None:
@@ -147,14 +211,6 @@ class TurnLock:
             return json.loads((lock_dir / "owner.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-
-    def _owner_or_raise(self, token: str) -> dict:
-        if not self._dir.exists():
-            raise StaleLock("turn lock no longer exists (released or taken over)")
-        owner = self._read_owner()
-        if owner is None or owner.get("token") != token:
-            raise NotLockOwner("token does not own the turn lock")
-        return owner
 
 
 def _remove_tree(path: Path) -> None:

@@ -23,18 +23,27 @@ from .control import ControlSchemaError, ControlStore
 
 
 def record_stop_request(store: ControlStore, *, turn_token: str | None = None) -> dict:
-    """Records a stop request bound to the current activity. Idempotent: an
-    equivalent pending request (same activity/epoch/token) is returned as-is."""
+    """Records a stop request bound to the current activity. Idempotent as a
+    TRUE no-op: an equivalent pending request (same activity/epoch/token) is
+    returned as-is WITHOUT bumping the control version."""
+    current = store.load()
+    if current.get("activity") is None:
+        raise ControlSchemaError("no activity to stop")
+    existing = current.get("stop_request")
+    if existing is not None and _matches_current(existing, current) \
+            and existing.get("turn_token") == turn_token:
+        return dict(existing)  # idempotent re-request: no mutation at all
+
     result: dict[str, Any] = {}
 
     def fn(body: dict) -> dict:
         activity = body.get("activity")
         if activity is None:
             raise ControlSchemaError("no activity to stop")
-        existing = body.get("stop_request")
-        if existing is not None and _matches_current(existing, body) \
-                and existing.get("turn_token") == turn_token:
-            result.update(existing)  # idempotent re-request
+        pending = body.get("stop_request")
+        if pending is not None and _matches_current(pending, body) \
+                and pending.get("turn_token") == turn_token:
+            result.update(pending)  # raced with an equivalent request
             return body
         request = {"id": uuid.uuid4().hex,
                    "activity_id": activity["id"],
@@ -59,6 +68,14 @@ def read_valid_stop_request(store: ControlStore) -> dict | None:
     if _matches_current(request, control):
         return dict(request)
 
+    # Audit the INTENT before acting: a crash between the two never leaves a
+    # completed discard without its record.
+    store.audit.append({"event": "stop_request_discarded", "request_id": request["id"],
+                        "reason": "stale (activity or turn diverged)",
+                        "activity_id": request.get("activity_id"),
+                        "activity_epoch": request.get("activity_epoch"),
+                        "turn_token": request.get("turn_token")})
+
     def discard(body: dict) -> dict:
         pending = body.get("stop_request")
         if pending is not None and pending.get("id") == request["id"]:
@@ -66,19 +83,25 @@ def read_valid_stop_request(store: ControlStore) -> dict | None:
         return body
 
     store.mutate(discard)
-    store.audit.append({"event": "stop_request_discarded", "request_id": request["id"],
-                        "reason": "stale (activity or turn diverged)",
-                        "activity_id": request.get("activity_id"),
-                        "activity_epoch": request.get("activity_epoch"),
-                        "turn_token": request.get("turn_token")})
     return None
 
 
 def suspend_activity(store: ControlStore, *, turn_token: str, checkpoint: str,
                      reason: str, in_flight: str | None = None) -> bool:
     """ACTIVE → SUSPENDED with the full REQ-004 §5 payload; consumes any pending
-    stop request. Idempotent: returns False if already suspended at the same
-    checkpoint (no-op), True if the transition was applied."""
+    stop request. Idempotent as a TRUE no-op: returns False (without bumping the
+    control version) if already suspended at the same checkpoint BY THE SAME
+    TURN; True if the transition was applied."""
+    current = store.load()
+    activity = current.get("activity")
+    if activity is not None and activity["state"] == "SUSPENDED":
+        suspension = activity.get("suspension") or {}
+        if suspension.get("checkpoint") == checkpoint:
+            if suspension.get("owning_turn") != turn_token:
+                from .control import NotLockOwner
+                raise NotLockOwner("re-apply requires the suspending turn token")
+            return False  # idempotent re-apply: no mutation at all
+
     applied = False
 
     def fn(body: dict) -> dict:
@@ -87,8 +110,10 @@ def suspend_activity(store: ControlStore, *, turn_token: str, checkpoint: str,
         if activity is None:
             raise ControlSchemaError("no activity to suspend")
         if activity["state"] == "SUSPENDED":
-            if (activity.get("suspension") or {}).get("checkpoint") == checkpoint:
-                return body  # idempotent re-apply
+            suspension = activity.get("suspension") or {}
+            if suspension.get("checkpoint") == checkpoint \
+                    and suspension.get("owning_turn") == turn_token:
+                return body  # raced with an equivalent suspension
             raise ControlSchemaError("already suspended at a different checkpoint")
         current_token = (activity.get("turn") or {}).get("token")
         if current_token != turn_token:

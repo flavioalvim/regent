@@ -9,8 +9,12 @@ Concurrency: read-check-replace alone is NOT a CAS (two writers could both
 validate the same version — lost update). Every mutation therefore runs inside
 a short exclusive mutation mutex (mkdir-style, distinct from the turn lock;
 never held while acquiring the turn lock — acquire the turn lock first, then
-mutate). A crashed holder leaves a recoverable mutex: stale (old or dead pid)
-mutex dirs are force-removed with an audit record.
+mutate). Mutex instances carry an identity token; recovery ONLY evicts a
+holder whose pid is dead (or an ownerless dir past the timeout) — an alive
+holder is never evicted, however slow, so two CAS winners are impossible.
+Recovery is audited BEFORE acting and claims the judged instance by atomic
+rename (two concurrent recoverers cannot both evict). The holder re-verifies
+its mutex identity immediately before publishing.
 
 Publication separates atomicity from durability: tempfile in the same
 directory → flush+fsync(file) → os.replace → fsync(directory).
@@ -34,6 +38,15 @@ ACTIVITY_TYPES = ("brainstorm", "plan", "build")
 ACTIVITY_STATES = ("ACTIVE", "SUSPENDED")
 _TMP_PREFIX = ".control-tmp-"
 
+_TOP_KEYS = {"schema_version", "version", "updated_at", "activity", "stop_request",
+             "last_concluded"}
+_ACTIVITY_KEYS = {"type", "id", "epoch", "state", "turn", "suspension"}
+_TURN_KEYS = {"owner", "token", "acquired_at"}
+_SUSPENSION_KEYS = {"previous_state", "checkpoint", "owning_turn", "in_flight",
+                    "reason", "at"}
+_REQUEST_KEYS = {"id", "activity_id", "activity_epoch", "turn_token", "requested_at"}
+_CONCLUDED_KEYS = {"type", "id", "status", "at"}
+
 
 class ControlSchemaError(ValueError):
     """Control file is corrupt, has an unknown schema or violates invariants."""
@@ -44,7 +57,7 @@ class VersionConflict(RuntimeError):
 
 
 class MutationMutexBusy(RuntimeError):
-    """Could not enter the mutation critical section within the timeout."""
+    """Could not enter (or keep) the mutation critical section."""
 
 
 class NotLockOwner(RuntimeError):
@@ -62,43 +75,85 @@ def initial_control() -> dict[str, Any]:
     }
 
 
+def _require_keys(obj: Mapping[str, Any], keys: set, label: str) -> None:
+    if not isinstance(obj, Mapping):
+        raise ControlSchemaError(f"{label} must be an object")
+    actual = set(obj.keys())
+    if actual != keys:
+        missing, extra = sorted(keys - actual), sorted(actual - keys)
+        raise ControlSchemaError(f"{label}: missing keys {missing}, unknown keys {extra}")
+
+
+def _require_str(value: Any, label: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise ControlSchemaError(f"{label} must be a non-empty string")
+
+
+def _require_timestamp(value: Any, label: str) -> None:
+    _require_str(value, label)
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        raise ControlSchemaError(f"{label} is not an ISO-8601 timestamp: {value!r}") from None
+
+
 def validate_control(control: Mapping[str, Any]) -> None:
-    if not isinstance(control, Mapping):
-        raise ControlSchemaError("control must be an object")
-    if control.get("schema_version") != SCHEMA_VERSION:
-        raise ControlSchemaError(f"unknown schema_version: {control.get('schema_version')!r}")
-    if not isinstance(control.get("version"), int) or control["version"] < 0:
+    """Strict default-deny validation: exact key sets, types, timestamps and the
+    ACTIVE/SUSPENDED invariants. Unknown or missing fields are rejected."""
+    _require_keys(control, _TOP_KEYS, "control")
+    if control["schema_version"] != SCHEMA_VERSION:
+        raise ControlSchemaError(f"unknown schema_version: {control['schema_version']!r}")
+    if not isinstance(control["version"], int) or control["version"] < 0:
         raise ControlSchemaError("version must be a non-negative int")
-    activity = control.get("activity")
+    _require_timestamp(control["updated_at"], "updated_at")
+
+    activity = control["activity"]
     if activity is not None:
-        if activity.get("type") not in ACTIVITY_TYPES:
-            raise ControlSchemaError(f"unknown activity type: {activity.get('type')!r}")
-        if not isinstance(activity.get("id"), str) or not activity["id"]:
-            raise ControlSchemaError("activity.id must be a non-empty string")
-        if not isinstance(activity.get("epoch"), int) or activity["epoch"] < 0:
+        _require_keys(activity, _ACTIVITY_KEYS, "activity")
+        if activity["type"] not in ACTIVITY_TYPES:
+            raise ControlSchemaError(f"unknown activity type: {activity['type']!r}")
+        _require_str(activity["id"], "activity.id")
+        if not isinstance(activity["epoch"], int) or activity["epoch"] < 0:
             raise ControlSchemaError("activity.epoch must be a non-negative int")
-        state = activity.get("state")
+        state = activity["state"]
         if state not in ACTIVITY_STATES:
             raise ControlSchemaError(f"unknown activity state: {state!r}")
-        turn, suspension = activity.get("turn"), activity.get("suspension")
+        turn, suspension = activity["turn"], activity["suspension"]
         if state == "ACTIVE" and (turn is None or suspension is not None):
             raise ControlSchemaError("ACTIVE requires turn and forbids suspension")
         if state == "SUSPENDED" and (turn is not None or suspension is None):
             raise ControlSchemaError("SUSPENDED requires suspension and forbids turn")
-        if turn is not None and not turn.get("token"):
-            raise ControlSchemaError("turn.token is required")
+        if turn is not None:
+            _require_keys(turn, _TURN_KEYS, "activity.turn")
+            if turn["owner"] != "executor":
+                raise ControlSchemaError("turn.owner must be 'executor' (REQ-003)")
+            _require_str(turn["token"], "turn.token")
+            _require_timestamp(turn["acquired_at"], "turn.acquired_at")
         if suspension is not None:
-            missing = [k for k in ("previous_state", "checkpoint", "owning_turn", "reason", "at")
-                       if not suspension.get(k)]
-            if missing:
-                raise ControlSchemaError(f"suspension payload missing: {missing}")
-    request = control.get("stop_request")
+            _require_keys(suspension, _SUSPENSION_KEYS, "activity.suspension")
+            for key in ("previous_state", "checkpoint", "owning_turn", "reason"):
+                _require_str(suspension[key], f"suspension.{key}")
+            if suspension["in_flight"] is not None:
+                _require_str(suspension["in_flight"], "suspension.in_flight")
+            _require_timestamp(suspension["at"], "suspension.at")
+
+    request = control["stop_request"]
     if request is not None:
-        for key in ("id", "activity_id", "requested_at"):
-            if not request.get(key):
-                raise ControlSchemaError(f"stop_request.{key} is required")
-        if not isinstance(request.get("activity_epoch"), int):
+        _require_keys(request, _REQUEST_KEYS, "stop_request")
+        _require_str(request["id"], "stop_request.id")
+        _require_str(request["activity_id"], "stop_request.activity_id")
+        if not isinstance(request["activity_epoch"], int):
             raise ControlSchemaError("stop_request.activity_epoch must be an int")
+        if request["turn_token"] is not None:
+            _require_str(request["turn_token"], "stop_request.turn_token")
+        _require_timestamp(request["requested_at"], "stop_request.requested_at")
+
+    concluded = control["last_concluded"]
+    if concluded is not None:
+        _require_keys(concluded, _CONCLUDED_KEYS, "last_concluded")
+        for key in ("type", "id", "status"):
+            _require_str(concluded[key], f"last_concluded.{key}")
+        _require_timestamp(concluded["at"], "last_concluded.at")
 
 
 def assert_turn_token(control: Mapping[str, Any], turn_token: str) -> None:
@@ -151,7 +206,7 @@ class ControlStore:
 
         With turn_token set, additionally enforces ABA fencing: the CURRENT
         stored control must carry that token as the active turn."""
-        with self._mutation_mutex():
+        with self._mutation_mutex() as mutex:
             self._clean_orphan_tempfiles()
             current = self.load()
             if turn_token is not None:
@@ -164,6 +219,8 @@ class ControlStore:
             control["version"] = expected_version + 1
             control["updated_at"] = utcnow()
             validate_control(control)
+            self._check_epoch_monotonic(current, control)
+            mutex.verify_still_held()  # belt-and-suspenders before publishing
             self._publish(control)
             return control
 
@@ -181,8 +238,18 @@ class ControlStore:
 
     # -- critical section -------------------------------------------------
 
-    def _mutation_mutex(self):
+    def _mutation_mutex(self) -> "_MutationMutex":
         return _MutationMutex(self._mutex_dir, self._audit, self._mutation_timeout)
+
+    @staticmethod
+    def _check_epoch_monotonic(current: Mapping[str, Any],
+                               new: Mapping[str, Any]) -> None:
+        current_activity, new_activity = current.get("activity"), new.get("activity")
+        if current_activity is not None and new_activity is not None:
+            if new_activity["epoch"] < current_activity["epoch"]:
+                raise ControlSchemaError(
+                    f"activity.epoch must not decrease "
+                    f"({current_activity['epoch']} -> {new_activity['epoch']})")
 
     def _clean_orphan_tempfiles(self) -> None:
         for orphan in self._path.parent.glob(_TMP_PREFIX + "*"):
@@ -220,9 +287,11 @@ _CRASH_BEFORE_REPLACE = False  # flipped only by crash-consistency tests
 class _MutationMutex:
     """Short exclusive mkdir-style mutex around control mutations.
 
-    Stale recovery: a mutex whose meta.json is older than the timeout, or whose
-    recorded pid is dead, is force-removed with an audit record so a crashed
-    holder never blocks future mutations."""
+    Instance identity: meta.json carries {pid, at, token}. Recovery ONLY
+    evicts a dead holder (or an ownerless dir past the timeout) — an alive
+    holder is never evicted. Eviction is audited BEFORE acting and claims the
+    judged instance by atomic rename, so concurrent recoverers cannot both
+    evict, and can never evict a fresh instance (token compare)."""
 
     _POLL = 0.01
 
@@ -230,8 +299,9 @@ class _MutationMutex:
         self._dir = mutex_dir
         self._audit = audit
         self._timeout = timeout
+        self._token: str | None = None
 
-    def __enter__(self):
+    def __enter__(self) -> "_MutationMutex":
         deadline = time.monotonic() + self._timeout
         while True:
             try:
@@ -244,47 +314,74 @@ class _MutationMutex:
                 if time.monotonic() >= deadline:
                     raise MutationMutexBusy(f"mutation mutex busy: {self._dir}") from None
                 time.sleep(self._POLL)
-        meta = {"pid": os.getpid(), "at": utcnow()}
+        self._token = uuid.uuid4().hex
+        meta = {"pid": os.getpid(), "at": utcnow(), "token": self._token}
         (self._dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
         return self
 
     def __exit__(self, *exc_info):
-        self._remove()
+        self._remove(self._dir)
         return False
 
+    def verify_still_held(self) -> None:
+        meta = self._read_meta(self._dir)
+        if meta is None or meta.get("token") != self._token:
+            raise MutationMutexBusy("mutation mutex lost during critical section")
+
     def _recover_if_stale(self) -> None:
-        meta_path = self._dir / "meta.json"
+        meta = self._read_meta(self._dir)
         stale_reason = None
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta is not None:
             holder_pid = int(meta.get("pid", -1))
-            held_at = datetime.fromisoformat(meta["at"])
-            age = (datetime.now(timezone.utc) - held_at).total_seconds()
-            if age > self._timeout:
-                stale_reason = f"held for {int(age)}s > timeout"
-            elif not _pid_alive(holder_pid):
+            if not _pid_alive(holder_pid):
                 stale_reason = f"holder pid {holder_pid} is dead"
-        except (OSError, ValueError, KeyError):
-            # No/corrupt meta: only stale once the dir itself outlives the timeout
-            # (grace for the window between mkdir and meta write).
+            # An ALIVE holder is never evicted, however old: evicting it could
+            # let two CAS writers win. Callers time out with MutationMutexBusy.
+        else:
             try:
                 age = time.time() - self._dir.stat().st_mtime
             except OSError:
                 return  # already gone
             if age > self._timeout:
                 stale_reason = f"ownerless mutex dir for {int(age)}s > timeout"
-        if stale_reason:
-            self._remove()
-            self._audit.append({"event": "mutation_mutex_recovered",
-                                "mutex": str(self._dir), "reason": stale_reason})
-
-    def _remove(self) -> None:
+        if not stale_reason:
+            return
+        judged_token = (meta or {}).get("token")
+        # Audit the INTENT first: a crash after this point leaves a record.
+        self._audit.append({"event": "mutation_mutex_recovered",
+                            "mutex": str(self._dir), "reason": stale_reason,
+                            "evicted_token": judged_token})
+        aside = self._dir.with_name(self._dir.name + f".evict-{uuid.uuid4().hex}")
         try:
-            (self._dir / "meta.json").unlink()
+            os.rename(self._dir, aside)  # atomic claim: one recoverer wins
+        except FileNotFoundError:
+            return  # someone else recovered it first
+        aside_meta = self._read_meta(aside)
+        if (aside_meta or {}).get("token") != judged_token:
+            # Fresh instance appeared in between: restore it, never evict.
+            try:
+                os.rename(aside, self._dir)
+            except OSError:
+                self._audit.append({"event": "mutation_mutex_restore_failed",
+                                    "aside": str(aside)})
+            return
+        self._remove(aside)
+
+    @staticmethod
+    def _read_meta(mutex_dir: Path) -> dict | None:
+        try:
+            return json.loads((mutex_dir / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _remove(mutex_dir: Path) -> None:
+        try:
+            (mutex_dir / "meta.json").unlink()
         except OSError:
             pass
         try:
-            os.rmdir(self._dir)
+            os.rmdir(mutex_dir)
         except OSError:
             pass
 

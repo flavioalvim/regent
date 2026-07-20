@@ -1,5 +1,6 @@
 # PLAN-001 / STEP-03 — Stop-request: representação e transições
 
+step_base_sha: 168adbd (commit do STEP-02)
 files_touched:
   - src/regent/protocol/stop.py (novo)
   - src/regent/protocol/control.py (property `audit` exposta — colaboração limpa)

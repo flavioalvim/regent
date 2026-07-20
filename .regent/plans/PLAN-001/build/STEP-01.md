@@ -1,6 +1,6 @@
 # PLAN-001 / STEP-01 — Control store transacional + auditoria
 
-step_base_sha: (HEAD no início da etapa = commit do baseline; ver trailer Regent-Step no git log)
+step_base_sha: 6cb860a (baseline commit)
 files_touched:
   - src/regent/protocol/__init__.py (novo, façade preenchida no STEP-04)
   - src/regent/protocol/audit.py (novo)

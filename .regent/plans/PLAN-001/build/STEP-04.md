@@ -1,5 +1,6 @@
 # PLAN-001 / STEP-04 — Façade nominal, gate de pacote e consolidação
 
+step_base_sha: 5b5eb3e (commit do STEP-03)
 files_touched:
   - src/regent/protocol/__init__.py (façade nominal com __all__)
   - tests/test_protocol_facade.py (novo)

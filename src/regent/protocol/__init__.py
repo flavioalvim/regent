@@ -5,10 +5,12 @@ Reimplements the invariants proven in the ArtNFT protocol layer
 control_adapters.py) under the regent v1 actor model (REQ-003: the executor is
 the only turn holder; the advisor never holds a turn).
 
-Public API (nominal, PLAN-001 STEP-04):
-- control: ControlStore, ControlSchemaError, VersionConflict, NotLockOwner
-  (turn-token fencing), MutationMutexBusy
-- lock:    TurnLock, LockHeld, StaleLock (+ lock-side NotLockOwner alias)
+Public API (nominal, PLAN-001 STEP-04; STEP-05 unified NotLockOwner into a
+single class raised by both control fencing and lock ownership checks):
+- control: ControlStore, ControlSchemaError, VersionConflict, NotLockOwner,
+  MutationMutexBusy (declared deviation: added to the approved nominal list —
+  callers need to catch a busy/lost mutation mutex)
+- lock:    TurnLock, LockHeld, StaleLock
 - stop:    record_stop_request, read_valid_stop_request, suspend_activity
 - audit:   AuditLog
 """
