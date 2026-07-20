@@ -1,23 +1,26 @@
-# regente
+# regent
 
-Condução autônoma e deliberação mediada entre agentes de IA, plugável em qualquer projeto.
+Autonomous conduction and mediated adversarial deliberation between AI agents, pluggable
+into any project.
 
-**regente** rege turnos entre agentes (Claude, Codex, humanos mediadores) sob um protocolo
-congelado: mutex atômico de turno, estado versionado por CAS, rodadas de deliberação com
-aceites versionados, e um daemon de condução que executa lotes de produção com agente
-confinado, gates de teste e prova de evidência.
+**regent** governs turns between agents (Claude, Codex, human mediators) under a frozen
+protocol: atomic turn mutex, CAS-versioned state, deliberation rounds with versioned
+acceptances, and a conduction daemon that executes production batches with a confined agent,
+test gates and evidence proof.
 
-Extraído da ferramenta provada ponta a ponta no projeto ArtNFT (IMP-003: primeiro lote de
-produto 100% conduzido pelo daemon, deliberado, aceito e deployado em produção).
+Extracted from the tool proven end-to-end in the ArtNFT project (IMP-003: first product
+batch fully conducted by the daemon, deliberated, accepted and deployed to production).
 
-- Escopo, decisões e inventário de extração: [`docs/ESCOPO.md`](docs/ESCOPO.md)
-- Estado: **pré-extração** (escopo fechado em 2026-07-20; código ainda não migrado)
+- Requirements: [`docs/PRD.md`](docs/PRD.md)
+- Extraction scope and decisions: [`docs/ESCOPO.md`](docs/ESCOPO.md) (PT-BR, pre-rename)
+- Deliberation rounds: [`docs/brainstorm/`](docs/brainstorm/) (mediator's language, PT-BR)
+- Status: **pre-extraction** (scope closed 2026-07-20; code not yet migrated)
 
-Uso previsto (v1):
+Planned usage (v1):
 
 ```bash
-pip install regente        # (nome livre no PyPI; repo privado por ora)
-regente init               # semeia CONTROLE/ESCOPO/skills no projeto host
+pip install regent-cli     # import/CLI name: regent (private repo for now)
+regent init                # seeds .regent/ + managed integrations in the host project
 ```
 
-© Flavio Alvim. Todos os direitos reservados (licença a definir).
+© Flavio Alvim. All rights reserved (license to be decided).

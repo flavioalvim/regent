@@ -1,4 +1,9 @@
-# ESCOPO — regente v1
+# ESCOPO — regent v1
+
+> ⚠️ **Supersessões (RODADA-001, 2026-07-20, ver `docs/PRD.md`):** nome do produto agora é
+> **regent** (repo `flavioalvim/regent`, CLI `regent`, PyPI `regent-cli`, raiz no host
+> `.regent/`); documentação do PRODUTO passa a nascer em inglês (revogação parcial ratificada
+> pelo dono — este arquivo migra quando for reescrito); política de idioma completa = REQ-002.
 
 Fechado com o dono em 2026-07-20. Este documento é a referência da extração: o que o
 produto é, o que sai do ArtNFT, o que se corrige no caminho e o que fica para depois.
