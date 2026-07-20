@@ -12,13 +12,16 @@ description: Safely stop/suspend the regent activity in progress (brainstorm rou
 
 ## Steps
 
-1. Detect the open round: `docs/brainstorm/rodadas/RODADA-NNN/` without `DECISAO.md`.
+1. Locate the rounds directory exactly as `/regent` does (step 0 of its skill: host =
+   `.regent/brainstorm/rodadas/`; the regent repo itself = `docs/brainstorm/rodadas/`; both
+   present = ambiguity, stop). Then detect the open round: `RODADA-NNN/` without `DECISAO.md`.
    - Nothing open → report that the state is clean (nothing to stop) and stop.
    - Ambiguous state → report the anomaly; do not modify anything.
 2. Write `SUSPENSAO.md` in the open round with: timestamp, reason given by the owner (ask if
    not stated), which artifact/step was pending (the resume checkpoint), and any partial
    output worth keeping (e.g. an advisor consultation already saved).
 3. Persist everything already produced — never delete partial artifacts; they are evidence.
-4. Commit ONLY regent-owned paths (`docs/`, `.regent/`, `.claude/` symlinks). A failed
-   commit does NOT prevent the suspension — report it and leave the commit pending.
+4. Commit ONLY regent-owned paths (`.regent/`, the `.claude/` symlink integrations, and —
+   in the regent repo only — `docs/`). A failed commit does NOT prevent the suspension —
+   report it and leave the commit pending.
 5. Confirm to the owner: what was suspended, where it will resume from (`/regent`).
