@@ -1,0 +1,17 @@
+A direção é boa: dois comandos evitam multiplicação da interface, retomada dirigida por estado é coerente com P-03 e a parada deve preservar evidência. Porém, a proposta ainda não está definida o suficiente para virar requisito e ser implementada imediatamente.
+
+1. **`/regent-stop` não consegue necessariamente interromper `/regent`.** Uma skill do Claude executada na mesma sessão não pode ser invocada enquanto outra interação está bloqueada numa consulta ou ferramenta. É preciso definir o modelo operacional: daemon destacado, segunda sessão, sinal externo ou outro canal de controle. Sem isso, `--abort` e “stop-request honrado pelo daemon” são promessas sem caminho executável.
+
+2. **A atomicidade da parada está subespecificada.** Deve existir uma ordem protocolar com CAS: registrar pedido identificado e vinculado ao turno, cancelar/terminar o subprocesso, persistir evidência, gravar checkpoint, transicionar para suspensão, liberar lock e confirmar. Também faltam regras para crash entre essas etapas, timeout esperando confirmação e pedidos antigos que sobrevivam à retomada. “O lock nunca fica retido” exige recuperação explícita de lock órfão; não pode ser garantido apenas pela skill.
+
+3. **`SUSPENDED` sozinho perde informação de retomada.** O controle precisa preservar ao menos atividade anterior, subestado/checkpoint, turno proprietário, operação em voo e motivo da suspensão. Além disso, `CANCELLED` é desfecho da consulta, enquanto `SUSPENDED` é estado da atividade; essa distinção deve aparecer formalmente no modelo, não apenas na narrativa.
+
+4. **Falta uma matriz determinística de estado × comando.** Não está definido o que `/regent plan` faz quando há brainstorm ou build ativo, quando há trabalho suspenso, quando o argumento diverge da atividade aberta, ou quando não existe controle inicializado. Também é necessário definir precedência entre retomada implícita e argumento explícito, evitando que o argumento seja silenciosamente ignorado ou crie uma segunda atividade.
+
+5. **O dogfood-lite proposto entra em tensão com REQ-001.** Criar conteúdo canônico diretamente em `.claude/skills/...` antes de `init` não o torna automaticamente uma managed integration. O conteúdo deveria nascer em `.regent/skills/`, com a integração externa instalada de forma idempotente e removível, ou a rodada deve registrar explicitamente uma exceção temporária e seu mecanismo de migração. Também é preciso resolver como os marcadores exigidos por REQ-001 se aplicam a symlinks.
+
+6. **A versão imediata não consegue cumprir toda a semântica anunciada.** O brainstorm atual é conduzido por arquivos em `docs/brainstorm/`, sem `control.json`, daemon ou protocolo de suspensão implementado. A skill provisória precisa declarar capacidades reduzidas e critérios objetivos para detectar a rodada corrente; não deve aparentar oferecer cancelamento atômico, checkpoint e retomada que ainda não existem.
+
+7. **“Commita” não deve ser invariante automático da parada sem política própria.** Um stop pode ocorrer com worktree suja, conflito, falha de hook ou ausência de alterações versionáveis. É necessário definir exatamente o que é commitado, por quem, como conteúdo alheio é excluído e se uma falha de commit impede a suspensão. Persistência durável da evidência deve ser requisito; commit Git é uma etapa distinta.
+
+DISCORDA

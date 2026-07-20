@@ -34,7 +34,9 @@ Decided in RODADA-001 (owner-ratified): product name **regent**; GitHub repo
    activation rules in `.claude/settings.local.json`, `.gitignore` entries). Each managed
    integration MUST have: delimited markers identifying regent-owned content, conflict
    detection against pre-existing host content, idempotent updates, and safe removal on
-   unplug. No other regent content may live outside `.regent/`.
+   unplug. No other regent content may live outside `.regent/`. For symlink integrations,
+   the ownership marker is the link target pointing inside `.regent/` (detectable and safely
+   removable); textual fragments require delimited markers. *(Clarified in RODADA-003.)*
 3. Persistence rule: every **persistent, shareable artifact** lives in `.regent/` — including
    audit ledgers and evidence tuples (auditable evidence is product value, cf. P-11). The XDG
    state directory (`regent/<slug>`) holds only **disposable local operational state** (process
@@ -98,6 +100,47 @@ opinions; residuals 3 and 5 conceded and defined by Claude).*
    path triggers Claude from the Codex environment; (c) a consultation that cannot persist
    its evidence fails; (d) a failed `init` leaves no partial state.
 
+### REQ-004 — Activity control commands: `/regent` and `/regent-stop`
+
+*Source: RODADA-003 (owner requirement; Codex objections 1–7 incorporated).*
+
+1. **Two commands only.** Activity state is singular, so the control pair operates on it;
+   activities (brainstorm, planning, implementation) are arguments/modes, not commands.
+   Both are Claude Code skills whose canonical content lives in `.regent/skills/` and is
+   installed into `.claude/skills/` as managed symlink integrations by `regent init`
+   (REQ-001 §2); English (REQ-002); executor-side only — stopping never depends on the
+   advisor (REQ-003).
+2. **`/regent` — state-driven single entry.** Reads the control state and resumes the open
+   activity. Precedence rules (normative): one active activity at a time; bare `/regent`
+   resumes only when exactly one activity is open/suspended, otherwise reports state and
+   options — it never starts anything implicitly; `/regent <mode>` with a divergent open
+   activity fails with an error explaining the state — it never silently ignores the
+   argument nor creates a second activity; with no initialized control it errors pointing
+   to `regent init`. Ambiguous/corrupted state → report and stop (default-deny).
+3. **`/regent-stop` — durable stop-request, not inter-skill interruption.** The stop channel
+   is a durable stop-request in the control (CAS): a detached daemon honors it at the next
+   boundary (`--abort` additionally kills the in-flight advisor consultation, recording
+   `CANCELLED` per REQ-003 §5); in an interactive session, immediate interruption is Claude
+   Code's own (user Esc) and `/regent-stop` normalizes state at the next message boundary;
+   writing the stop-request from another session/terminal is equally valid.
+4. **Canonical stop sequence** (each step idempotent; on crash, resume re-executes from the
+   first incomplete step): (1) record turn-linked stop-request via CAS; (2) end/cancel the
+   in-flight sub-step; (3) persist evidence; (4) write resume checkpoint; (5) transition
+   activity → `SUSPENDED` via CAS; (6) release lock; (7) confirm. Stale stop-requests are
+   discarded on read, with a record. Orphan-lock recovery belongs to the protocol layer
+   (staleness detection), not to the skill.
+5. **State model.** `SUSPENDED` MUST carry: previous activity, substate/checkpoint, owning
+   turn, in-flight operation (if any), and reason. Consultation outcomes (REQ-003 §5) are
+   sub-step attributes; activity states belong to the control — the two axes never mix.
+6. **Commit policy.** Durable evidence persistence under `.regent/` is the requirement;
+   git commit is a distinct, non-blocking step covering ONLY regent-owned paths (`.regent/`
+   + marked integrations), never unrelated host content. A failed commit never prevents
+   suspension; it is reported and left pending.
+7. **v0 (file-driven) dogfood.** Until extraction lands, the two skills operate at a
+   declared reduced capability level: state = brainstorm round files (open round = round dir
+   without `DECISAO.md`), stop = `SUSPENSAO.md` marker + commit, no daemon/lock/abort. The
+   skills MUST state their capability level and never claim semantics that do not exist yet.
+
 ## Requirement log
 
 | REQ | Title | Round | Status |
@@ -105,3 +148,4 @@ opinions; residuals 3 and 5 conceded and defined by Claude).*
 | REQ-001 | Host footprint under `.regent/` | RODADA-001 | Accepted (consensus + owner) |
 | REQ-002 | Three-layer language policy | RODADA-001 | Accepted (consensus + owner) |
 | REQ-003 | Agent roles and execution runtime | RODADA-002 | Accepted (consensus) |
+| REQ-004 | Activity control commands `/regent`, `/regent-stop` | RODADA-003 | Accepted (consensus) |
