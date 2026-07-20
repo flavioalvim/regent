@@ -87,7 +87,8 @@ def read_valid_stop_request(store: ControlStore) -> dict | None:
 
 
 def suspend_activity(store: ControlStore, *, turn_token: str, checkpoint: str,
-                     reason: str, in_flight: str | None = None) -> bool:
+                     reason: str, in_flight: str | None = None,
+                     evidence: list[str] | None = None) -> bool:
     """ACTIVE → SUSPENDED with the full REQ-004 §5 payload; consumes any pending
     stop request. Idempotent as a TRUE no-op: returns False (without bumping the
     control version) if already suspended at the same checkpoint BY THE SAME
@@ -124,6 +125,7 @@ def suspend_activity(store: ControlStore, *, turn_token: str, checkpoint: str,
                                   "owning_turn": current_token,
                                   "in_flight": in_flight,
                                   "reason": reason,
+                                  "evidence": list(evidence or []),
                                   "at": utcnow()}
         activity["state"] = "SUSPENDED"
         activity["turn"] = None

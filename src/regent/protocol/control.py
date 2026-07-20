@@ -43,7 +43,7 @@ _TOP_KEYS = {"schema_version", "version", "updated_at", "activity", "stop_reques
 _ACTIVITY_KEYS = {"type", "id", "epoch", "state", "turn", "suspension"}
 _TURN_KEYS = {"owner", "token", "acquired_at"}
 _SUSPENSION_KEYS = {"previous_state", "checkpoint", "owning_turn", "in_flight",
-                    "reason", "at"}
+                    "reason", "evidence", "at"}
 _REQUEST_KEYS = {"id", "activity_id", "activity_epoch", "turn_token", "requested_at"}
 _CONCLUDED_KEYS = {"type", "id", "status", "epoch", "at"}
 
@@ -149,6 +149,10 @@ def validate_control(control: Mapping[str, Any]) -> None:
             _require_token(suspension["owning_turn"], "suspension.owning_turn")
             if suspension["in_flight"] is not None:
                 _require_str(suspension["in_flight"], "suspension.in_flight")
+            evidence = suspension["evidence"]
+            if not isinstance(evidence, list) \
+                    or any(not isinstance(p, str) or not p for p in evidence):
+                raise ControlSchemaError("suspension.evidence must be a list of paths")
             _require_timestamp(suspension["at"], "suspension.at")
 
     request = control["stop_request"]
@@ -179,10 +183,15 @@ def assert_turn_token(control: Mapping[str, Any], turn_token: str) -> None:
 
 class ControlStore:
     def __init__(self, path: Path, audit: AuditLog, *,
-                 mutation_timeout: float = 60.0) -> None:
+                 mutation_timeout: float = 60.0,
+                 lock_file: Path | None = None) -> None:
         self._path = Path(path)
         self._audit = audit
-        self._mutex_file = self._path.with_name(self._path.name + ".lock")
+        # PLAN-001 errata (PLAN-002 STEP-01): the mutation lock is disposable
+        # process state, so the PRODUCT places it in the XDG state dir
+        # (REQ-001 §3). The adjacent default remains for bare-library use only.
+        self._mutex_file = (Path(lock_file) if lock_file is not None
+                            else self._path.with_name(self._path.name + ".lock"))
         self._mutation_timeout = mutation_timeout
 
     @property

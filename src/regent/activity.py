@@ -1,0 +1,332 @@
+"""Application layer: composed activity operations over regent.protocol.
+
+PLAN-002 STEP-01. Each public operation composes two transactional domains —
+the turn lock (XDG local state) and the control.json (versioned CAS) — with a
+canonical order and idempotent crash recovery. Recovery ALWAYS inspects
+(control, lock, local token copy) and acts by the normative 12-row table in
+PLAN-002; every entry point runs it first.
+
+Token contract: the AUTHORITATIVE fencing token is control.activity.turn.token;
+the XDG `turn.json` is a local convenience copy for the CLI (rows 2/10/11/12
+repair it). P-01 is intact: TurnLock.acquire() touches only the XDG side —
+`start` is the COMPOSED operation that also mutates control.json.
+
+Canonical orders:
+  start:    recover → acquire lock → CAS ACTIVE(epoch=floor+1, token) → write turn.json
+  suspend:  recover → CAS SUSPENDED(payload+evidence) → release lock → clear turn.json
+  resume:   recover → acquire lock → CAS ACTIVE(epoch+1, new token) → write turn.json
+  conclude: recover → CAS(last_concluded, activity=null) → release lock → clear turn.json
+A crash between any two steps lands on a table row; re-running recovers.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from .protocol import (AuditLog, ControlStore, NotLockOwner, TurnLock,
+                       record_stop_request, read_valid_stop_request,
+                       suspend_activity)
+from .protocol.audit import utcnow
+from .protocol.control import ACTIVITY_TYPES, ControlSchemaError
+
+_CRASH_POINTS: set[str] = set()  # test hook: os._exit(43) at named boundaries
+
+
+def _maybe_crash(point: str) -> None:
+    if point in _CRASH_POINTS:
+        os._exit(43)
+
+
+class ActivityError(Exception):
+    code = "ACTIVITY"
+
+    def __init__(self, detail: Any = None, message: str | None = None) -> None:
+        super().__init__(message or self.code)
+        self.detail = detail
+
+
+class NoActivity(ActivityError):
+    code = "NO_ACTIVITY"
+
+
+class NotActive(ActivityError):
+    code = "NOT_ACTIVE"
+
+
+class NotSuspended(ActivityError):
+    code = "NOT_SUSPENDED"
+
+
+class ActivityOpen(ActivityError):
+    code = "ACTIVITY_OPEN"
+
+
+class TokenMismatch(ActivityError):
+    code = "TOKEN_MISMATCH"
+
+
+class LockSuspectError(ActivityError):
+    code = "LOCK_SUSPECT"
+
+
+def default_state_dir(repo_root: Path) -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME",
+                               str(Path.home() / ".local" / "state")))
+    digest = hashlib.sha256(str(Path(repo_root).resolve()).encode()).hexdigest()[:16]
+    return base / "regent" / digest
+
+
+class ActivityService:
+    def __init__(self, repo_root: Path, state_dir: Path | None = None) -> None:
+        self.root = Path(repo_root).resolve()
+        self.state_dir = Path(state_dir) if state_dir else default_state_dir(self.root)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        regent_dir = self.root / ".regent"
+        self.audit = AuditLog(regent_dir / "protocol" / "audit.jsonl")
+        self.store = ControlStore(regent_dir / "control.json", self.audit,
+                                  lock_file=self.state_dir / "control.lock")
+        self.lock = TurnLock(self.state_dir, self.audit)
+        self.token_file = self.state_dir / "turn.json"
+
+    # -- public operations -------------------------------------------------
+
+    def start(self, activity_type: str, activity_id: str) -> dict:
+        if activity_type not in ACTIVITY_TYPES:
+            raise ActivityError({"type": activity_type}, "unknown activity type")
+        control = self._recover()
+        if control["activity"] is not None:
+            raise ActivityOpen({"activity": _activity_obj(control["activity"])})
+        token = self.lock.acquire()
+        _maybe_crash("start:after_lock")
+        epoch = self._floor(control) + 1
+        control = self.store.mutate(lambda body: _set_active(
+            body, activity_type, activity_id, epoch, token))
+        if (control["activity"] or {}).get("turn", {}).get("token") != token:
+            # Raced: another start won between our recover and CAS. Undo ours.
+            self._release_quietly(token)
+            raise ActivityOpen({"activity": _activity_obj(control["activity"])})
+        _maybe_crash("start:after_cas")
+        self._write_local_token(token)
+        return {"activity": _activity_obj(control["activity"]), "token": token,
+                "checkpoint": None}
+
+    def resume(self, activity_id: str | None = None) -> dict:
+        control = self._recover()
+        activity = control["activity"]
+        if activity is None:
+            raise NoActivity({"state": "idle"})
+        if activity["state"] != "SUSPENDED":
+            raise NotSuspended({"state": activity["state"]})
+        if activity_id is not None and activity["id"] != activity_id:
+            raise ActivityError({"open": activity["id"], "asked": activity_id},
+                                "a DIFFERENT activity is suspended")
+        suspension = activity["suspension"]
+        token = self.lock.acquire()
+        _maybe_crash("resume:after_lock")
+        epoch = self._floor(control) + 1  # every (re)start increments (PLAN-001)
+
+        def fn(body: dict) -> dict:
+            body["activity"] = {"type": activity["type"], "id": activity["id"],
+                                "epoch": epoch, "state": "ACTIVE",
+                                "suspension": None,
+                                "turn": {"owner": "executor", "token": token,
+                                         "acquired_at": utcnow()}}
+            return body
+
+        control = self.store.mutate(fn)
+        _maybe_crash("resume:after_cas")
+        self._write_local_token(token)
+        missing = [p for p in suspension.get("evidence", [])
+                   if not (self.root / p).exists()]
+        return {"activity": _activity_obj(control["activity"]), "token": token,
+                "checkpoint": suspension["checkpoint"],
+                "missing_evidence": missing}
+
+    def suspend(self, *, checkpoint: str, reason: str,
+                in_flight: str | None = None,
+                evidence: list[str] | None = None) -> dict:
+        control = self._recover()
+        activity = control["activity"]
+        if activity is None:
+            raise NoActivity({"state": "idle"})
+        if activity["state"] != "ACTIVE":
+            raise NotActive({"state": activity["state"]})
+        token = activity["turn"]["token"]
+        suspend_activity(self.store, turn_token=token, checkpoint=checkpoint,
+                         reason=reason, in_flight=in_flight, evidence=evidence)
+        _maybe_crash("suspend:after_cas")
+        self._release_quietly(token)
+        _maybe_crash("suspend:before_token_cleanup")
+        self._clear_local_token()
+        control = self.store.load()
+        return {"activity": _activity_obj(control["activity"]),
+                "checkpoint": checkpoint}
+
+    def conclude(self, status: str) -> dict:
+        control = self._recover()
+        activity = control["activity"]
+        if activity is None:
+            raise NoActivity({"state": "idle"})
+        if activity["state"] != "ACTIVE":
+            raise NotActive({"state": activity["state"]})
+        token = activity["turn"]["token"]
+
+        def fn(body: dict) -> dict:
+            act = body["activity"]
+            body["last_concluded"] = {"type": act["type"], "id": act["id"],
+                                      "status": status, "epoch": act["epoch"],
+                                      "at": utcnow()}
+            body["activity"] = None
+            return body
+
+        control = self.store.mutate(fn, turn_token=token)
+        _maybe_crash("conclude:after_cas")
+        self._release_quietly(token)
+        _maybe_crash("conclude:before_token_cleanup")
+        self._clear_local_token()
+        return {"last_concluded": control["last_concluded"]}
+
+    def heartbeat(self) -> dict:
+        self._recover()
+        token = self._read_local_token()
+        if token is None:
+            raise NoActivity({"state": "no local turn token"})
+        self.lock.heartbeat(token)
+        return {"heartbeat_at": utcnow()}
+
+    def takeover(self, *, reason: str, actor: str = "mediator") -> dict:
+        control = self.store.load()
+        activity = control.get("activity")
+        previous = ((activity or {}).get("turn") or {}).get("token")
+        token = self.lock.takeover(actor=actor, reason=reason,
+                                   control_store=self.store)
+        self._write_local_token(token)
+        return {"token": token, "previous_owner": previous}
+
+    def stop_request(self) -> dict:
+        control = self._recover()
+        activity = control["activity"]
+        if activity is None:
+            raise NoActivity({"state": "idle"})
+        if activity["state"] == "SUSPENDED":  # normalized no-op (PLAN-002)
+            return {"request": None, "noop": True}
+        return {"request": record_stop_request(self.store, turn_token=None),
+                "noop": False}
+
+    def stop_check(self) -> dict:
+        request = read_valid_stop_request(self.store)
+        return {"stop_requested": request is not None, "request": request}
+
+    def status(self) -> dict:
+        try:
+            control = self.store.load()
+            control_view: Any = {"version": control["version"],
+                                 "activity": _activity_obj(control["activity"]),
+                                 "stop_request": control["stop_request"],
+                                 "last_concluded": control["last_concluded"]}
+        except ControlSchemaError as exc:
+            control_view = ("uninitialized"
+                            if "does not exist" in str(exc) else "corrupt")
+        lock_status = self.lock.status()
+        return {"control": control_view,
+                "lock": {"state": lock_status["state"],
+                         "age_seconds": lock_status["age_seconds"]},
+                "local_token_present": self._read_local_token() is not None}
+
+    # -- recovery (normative 12-row table) ---------------------------------
+
+    def _recover(self) -> dict:
+        """Repairs repairable rows, raises on mediator-decision rows, and
+        returns the (possibly repaired) current control."""
+        control = self.store.load()
+        activity = control["activity"]
+        lock_status = self.lock.status()
+        lock_state = lock_status["state"]
+        lock_token = (lock_status["owner"] or {}).get("token")
+        local = self._read_local_token()
+
+        if activity is not None and activity["state"] == "ACTIVE":
+            control_token = activity["turn"]["token"]
+            if lock_state == "held" and lock_token == control_token:
+                if local != control_token:  # rows 2 and 12
+                    self._write_local_token(control_token)
+            elif lock_state == "free":  # row 3
+                raise LockSuspectError(
+                    {"lock": {"state": "free", "age_seconds": None}},
+                    "control is ACTIVE but no lock exists — run "
+                    "`regent activity takeover --reason ...` (mediated)")
+            elif lock_state == "suspect":  # row 4
+                raise LockSuspectError(
+                    {"lock": {"state": "suspect",
+                              "age_seconds": lock_status["age_seconds"]}},
+                    "turn lock is suspect — run takeover (mediated)")
+            else:  # row 5: held by a DIFFERENT token
+                raise TokenMismatch({"control_token": control_token,
+                                     "held_token": lock_token})
+        else:  # SUSPENDED or idle
+            if lock_state in ("held", "suspect") and lock_token:  # rows 6 and 8
+                self._release_quietly(lock_token)
+            if self._read_local_token() is not None:  # rows 10 and 11
+                self._clear_local_token()
+        return self.store.load()
+
+    # -- internals ---------------------------------------------------------
+
+    def _floor(self, control: dict) -> int:
+        values = [-1]
+        if control.get("activity") is not None:
+            values.append(control["activity"]["epoch"])
+        if control.get("last_concluded") is not None:
+            values.append(control["last_concluded"]["epoch"])
+        return max(values)
+
+    def _release_quietly(self, token: str) -> None:
+        from .protocol import StaleLock
+        try:
+            self.lock.release(token)
+        except (NotLockOwner, StaleLock, OSError) as exc:
+            # Recovery path: a vanished/foreign lock is already the desired
+            # outcome; a strict-removal failure is surfaced by the next
+            # recovery pass. Audited for observability either way.
+            self.audit.append({"event": "release_during_recovery_skipped",
+                               "token": token, "reason": repr(exc)})
+
+    def _read_local_token(self) -> str | None:
+        try:
+            return json.loads(self.token_file.read_text(encoding="utf-8"))["token"]
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def _write_local_token(self, token: str) -> None:
+        tmp = self.token_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"token": token, "at": utcnow()}),
+                       encoding="utf-8")
+        os.replace(tmp, self.token_file)
+
+    def _clear_local_token(self) -> None:
+        try:
+            self.token_file.unlink()
+        except OSError:
+            pass
+
+
+def _activity_obj(activity: dict | None) -> dict | None:
+    if activity is None:
+        return None
+    return {"type": activity["type"], "id": activity["id"],
+            "epoch": activity["epoch"], "state": activity["state"]}
+
+
+def _set_active(body: dict, activity_type: str, activity_id: str,
+                epoch: int, token: str) -> dict:
+    if body.get("activity") is not None:
+        return body  # raced: caller re-inspects
+    body["activity"] = {"type": activity_type, "id": activity_id, "epoch": epoch,
+                        "state": "ACTIVE", "suspension": None,
+                        "turn": {"owner": "executor", "token": token,
+                                 "acquired_at": utcnow()}}
+    return body
