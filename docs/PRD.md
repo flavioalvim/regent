@@ -1,9 +1,11 @@
 # regent — Product Requirements Document
 
-**regent** conducts autonomous work and mediated adversarial deliberation between AI agents
-(Claude, Codex, human mediators), pluggable into any host project. Extracted from the tool
-proven end-to-end in the ArtNFT project (IMP-003: first product batch fully conducted by the
-daemon, deliberated, accepted and deployed to production).
+**regent** conducts autonomous work and mediated adversarial deliberation, pluggable into
+any host project. It runs inside the **Claude Code CLI** (the execution runtime); **Codex**
+participates strictly as an **advisor** (read-only consultations recorded as evidence); a
+**human mediator** governs decisions. Extracted from the tool proven end-to-end in the
+ArtNFT project (IMP-003: first product batch fully conducted by the daemon, deliberated,
+accepted and deployed to production).
 
 This PRD is the product's requirements record. Each requirement traces to a deliberation
 round under `docs/brainstorm/rodadas/` (deliberation content is written in the mediator's
@@ -56,9 +58,50 @@ Decided in RODADA-001 (owner-ratified): product name **regent**; GitHub repo
 4. Mixed files follow the layer of each part: structured fields always English; free-text
    bodies follow their layer's language.
 
+### REQ-003 — Agent roles and execution runtime
+
+*Source: RODADA-002 (owner requirement; Codex objections 1–6 incorporated across two
+opinions; residuals 3 and 5 conceded and defined by Claude).*
+
+1. **Roles.** **Executor** — holds the work turn, writes to the host repo, runs the
+   conduction. **Advisor** — consulted by the executor or mediator; always read-only; never
+   holds a turn; never writes to the host repo or regent artifacts (the advisor CLI's own
+   internal state outside the repo is out of scope). **Mediator** — the human who governs
+   decisions and state transitions without holding work turns.
+2. **V1 bindings are mandatory, not configurable.** Executor = Claude Code CLI; Advisor =
+   Codex CLI. Any Codex→Claude control flow is prohibited by requirement. The
+   executor/advisor roles exist as internal extension seams only — no v1 configuration
+   surface accepts a different executor.
+3. **What migrates.** The unidirectional headless consult adapter migrates (invocation MUST
+   enforce `--sandbox read-only` and `--ask-for-approval never`). The Codex turn-holding
+   path does not migrate (turn-entry scripts, symmetric skills, dual agent identity in the
+   turn lock).
+4. **Protocol consequence.** The mutex/CAS mechanism is preserved, but the actor model
+   changes: the executor is the ONLY agent that can hold a turn; advisor consultations are
+   evidence-recorded sub-steps of the executor's turn, not turns.
+5. **Consultation semantics.** Terminal outcomes: `SUCCESS`, `TIMEOUT`, `FAILURE` (non-zero
+   exit), `CANCELLED` (mediator abort). Invariants: (i) turn ownership is unchanged
+   throughout a consultation; (ii) fail-closed — a non-`SUCCESS` outcome never advances a
+   decision that requires advice; (iii) every outcome persists evidence under `.regent/`:
+   full prompt, full response (or partial output on failure), exit code, timestamp, and
+   turn/round linkage; (iv) resuming means issuing a NEW evidence-recorded consultation,
+   never partially resuming one. The detailed state machine is specified in the protocol
+   design round.
+6. **`regent init` / `regent doctor` contract.** `init` = installation/seeding, atomic:
+   exit 0 only on complete seeding; otherwise non-zero with safe rollback and no partial
+   state; a missing agent CLI is a warning, not an init failure. `doctor` = capability
+   diagnostics via safe non-interactive probes: exit 0 iff all capabilities are usable;
+   structured per-capability report. A command requiring an unavailable capability fails
+   with an explicit error naming the capability and pointing to `doctor`. The
+   command×capability matrix is fixed in the CLI interface round.
+7. **Acceptance criteria (tests).** (a) the advisor can never acquire a turn; (b) no code
+   path triggers Claude from the Codex environment; (c) a consultation that cannot persist
+   its evidence fails; (d) a failed `init` leaves no partial state.
+
 ## Requirement log
 
 | REQ | Title | Round | Status |
 |---|---|---|---|
 | REQ-001 | Host footprint under `.regent/` | RODADA-001 | Accepted (consensus + owner) |
 | REQ-002 | Three-layer language policy | RODADA-001 | Accepted (consensus + owner) |
+| REQ-003 | Agent roles and execution runtime | RODADA-002 | Accepted (consensus) |

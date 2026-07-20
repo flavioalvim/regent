@@ -4,6 +4,15 @@
 > **regent** (repo `flavioalvim/regent`, CLI `regent`, PyPI `regent-cli`, raiz no host
 > `.regent/`); documentação do PRODUTO passa a nascer em inglês (revogação parcial ratificada
 > pelo dono — este arquivo migra quando for reescrito); política de idioma completa = REQ-002.
+>
+> ⚠️ **Supersessões (RODADA-002, 2026-07-20, REQ-003):** runtime de execução = **Claude Code
+> CLI** (obrigatório, não-configurável no v1); **Codex = sempre Advisor** (read-only, nunca
+> detém turno; fluxo Codex→Claude proibido). Onde este arquivo descreve deliberação
+> Claude×Codex **simétrica**, turno do Codex ou "outros pares" como opção de v1, vale o
+> REQ-003: do inventário da camada DELIBERAÇÃO/CONDUÇÃO, **não migram** `run_codex.py`, a
+> skill `$responda-claude` e a identidade dual `AGENTS=("claude","codex")` no turn lock;
+> **migra** o adapter unidirecional de consulta headless (`CodexConsultAdapter`). Ports
+> executor/advisor ficam como costura interna, sem configuração exposta.
 
 Fechado com o dono em 2026-07-20. Este documento é a referência da extração: o que o
 produto é, o que sai do ArtNFT, o que se corrige no caminho e o que fica para depois.
