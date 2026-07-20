@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regent-cli"
+version = "0.1.0"
+description = "Autonomous conduction and mediated adversarial deliberation between AI agents, pluggable into any project."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary. All rights reserved." }
+authors = [{ name = "Flavio Alvim", email = "flavioalvim@gmail.com" }]
+
+[project.scripts]
+regent = "regent.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+regent = ["templates/**/*"]

@@ -16,25 +16,21 @@ batch fully conducted by the daemon, deliberated, accepted and deployed to produ
 - Deliberation rounds: [`docs/brainstorm/`](docs/brainstorm/) (mediator's language, PT-BR)
 - Status: **pre-extraction** (scope closed 2026-07-20; code not yet migrated)
 
-Planned usage (v1):
+## Install
 
 ```bash
-pip install regent-cli     # import/CLI name: regent (private repo for now)
-regent init                # seeds .regent/ + managed integrations in the host project
-```
-
-Manual installation today (v0 — exactly what `regent init` will automate):
-
-```bash
+pip install <path-to-this-repo>   # package: regent-cli; CLI: regent (not on PyPI yet)
 cd <your-project>
-cp -r <path-to-regent-repo>/.regent .          # 1. copy the .regent/ folder (note the dot)
-mkdir -p .claude/skills                         # 2. link the commands so Claude Code finds them
-ln -s ../../.regent/skills/regent .claude/skills/regent
-ln -s ../../.regent/skills/regent-stop .claude/skills/regent-stop
+regent init                        # seeds .regent/ + .claude/skills symlinks (atomic, idempotent)
+regent doctor                      # checks executor (claude) and advisor (codex) CLIs
 ```
 
-Then open a Claude Code session in the project — `/regent` and `/regent-stop` are available.
-v0 capability is file-driven (brainstorm rounds under `.regent/brainstorm/rodadas/`); the
-advisor requires the `codex` CLI installed.
+Then open a Claude Code session in the project — `/regent` and `/regent-stop` are available
+(`/regent brainstorm "<question>"` opens the first round). v0 capability is file-driven
+(rounds under `.regent/brainstorm/rodadas/`); the advisor requires the `codex` CLI.
+
+Development: `PYTHONPATH=src python3 -m unittest discover -s tests`. Canonical skill content
+lives in `src/regent/templates/` (ships inside the wheel); the repo's own `.regent/skills/`
+symlinks into it (dogfood without duplication).
 
 © Flavio Alvim. All rights reserved (license to be decided).
