@@ -222,20 +222,56 @@ class ActivityService:
         return {"stop_requested": request is not None, "request": request}
 
     def status(self) -> dict:
+        activity = None
         try:
             control = self.store.load()
+            activity = control["activity"]
             control_view: Any = {"version": control["version"],
-                                 "activity": _activity_obj(control["activity"]),
+                                 "activity": _activity_obj(activity),
                                  "stop_request": control["stop_request"],
                                  "last_concluded": control["last_concluded"]}
         except ControlSchemaError as exc:
             control_view = ("uninitialized"
                             if "does not exist" in str(exc) else "corrupt")
         lock_status = self.lock.status()
+        workspace = ({"open_artifacts": [], "verdict": "CORRUPT_CONTROL"}
+                     if control_view == "corrupt"
+                     else self.workspace_report(activity))
         return {"control": control_view,
                 "lock": {"state": lock_status["state"],
                          "age_seconds": lock_status["age_seconds"]},
-                "local_token_present": self._read_local_token() is not None}
+                "local_token_present": self._read_local_token() is not None,
+                "workspace": workspace}
+
+    # -- control×files matrix (normative, PLAN-002 — executable) ------------
+
+    def workspace_report(self, activity: dict | None) -> dict:
+        open_artifacts = self._scan_open_artifacts()
+        return {"open_artifacts": open_artifacts,
+                "verdict": classify_workspace(activity, open_artifacts,
+                                              self.root)}
+
+    def _scan_open_artifacts(self) -> list[str]:
+        """Open content dirs by the v0 rules: EN scheme + legacy PT scheme."""
+        found = []
+        rounds = self.root / ".regent" / "brainstorm" / "rounds"
+        for entry in sorted(rounds.glob("ROUND-*")):
+            if entry.is_dir() and not (entry / "DECISION.md").exists():
+                found.append(entry.name)
+        legacy = self.root / ".regent" / "brainstorm" / "rodadas"
+        for entry in sorted(legacy.glob("RODADA-*")):
+            if entry.is_dir() and not (entry / "DECISAO.md").exists():
+                found.append(entry.name)
+        plans = self.root / ".regent" / "plans"
+        for entry in sorted(plans.glob("PLAN-*")):
+            if not entry.is_dir():
+                continue
+            if not (entry / "APPROVAL.md").exists():
+                found.append(entry.name)
+            elif (entry / "build").is_dir() \
+                    and not (entry / "build" / "CONCLUSION.md").exists():
+                found.append(entry.name)
+        return found
 
     # -- recovery (normative 12-row table) ---------------------------------
 
@@ -312,6 +348,61 @@ class ActivityService:
             self.token_file.unlink()
         except OSError:
             pass
+
+
+WORKSPACE_VERDICTS = (
+    "OK", "SUSPENDED_OK", "IDLE_CLEAN",  # proceedable
+    "ORPHAN_NO_DIR", "ORPHAN_WITH_OTHER_OPEN", "SUSPENDED_ORPHAN",
+    "TYPE_MISMATCH", "SECOND_ARTIFACT", "TERMINAL_EXISTS", "MULTIPLE_OPEN",
+    "LEGACY_OPEN_ARTIFACT", "CORRUPT_CONTROL",  # mediator-decision rows
+)
+
+
+def classify_workspace(activity: dict | None, open_artifacts: list[str],
+                       root: Path) -> str:
+    """The PLAN-002 control×files matrix, row by row (default-deny)."""
+    if activity is None:
+        if not open_artifacts:
+            return "IDLE_CLEAN"
+        if len(open_artifacts) > 1:
+            return "MULTIPLE_OPEN"
+        return "LEGACY_OPEN_ARTIFACT"  # ask the mediator; never adopt silently
+
+    aid, atype, state = activity["id"], activity["type"], activity["state"]
+    others = [a for a in open_artifacts if a != aid]
+    own_dir = _artifact_dir(root, aid)
+    type_ok = (atype == "brainstorm") == aid.startswith("ROUND-") \
+        if aid.startswith(("ROUND-", "PLAN-")) else False
+
+    if own_dir is None or not own_dir.exists():
+        if others:
+            return "ORPHAN_WITH_OTHER_OPEN"
+        return "SUSPENDED_ORPHAN" if state == "SUSPENDED" else "ORPHAN_NO_DIR"
+    if not type_ok:
+        return "TYPE_MISMATCH"
+    if others:
+        return "SECOND_ARTIFACT" if len(others) == 1 else "MULTIPLE_OPEN"
+    if state == "SUSPENDED":
+        return "SUSPENDED_OK"
+    if _terminal_exists(own_dir, atype):
+        return "TERMINAL_EXISTS"
+    return "OK"
+
+
+def _artifact_dir(root: Path, activity_id: str) -> Path | None:
+    if activity_id.startswith("ROUND-"):
+        return root / ".regent" / "brainstorm" / "rounds" / activity_id
+    if activity_id.startswith("PLAN-"):
+        return root / ".regent" / "plans" / activity_id
+    return None
+
+
+def _terminal_exists(artifact_dir: Path, activity_type: str) -> bool:
+    if activity_type == "brainstorm":
+        return (artifact_dir / "DECISION.md").exists()
+    if activity_type == "plan":
+        return (artifact_dir / "APPROVAL.md").exists()
+    return (artifact_dir / "build" / "CONCLUSION.md").exists()
 
 
 def _activity_obj(activity: dict | None) -> dict | None:

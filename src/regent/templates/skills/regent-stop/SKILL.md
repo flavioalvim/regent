@@ -5,28 +5,34 @@ description: Safely stop/suspend the regent activity in progress (brainstorm rou
 
 # /regent-stop — safe stop of the current activity
 
-> **Capability level: v0 (file-driven).** There is no daemon, lock or in-flight abort yet:
-> stopping means recording a durable suspension marker at the next message boundary. Do not
-> claim atomic cancellation — immediate interruption of a running step is the user's Esc,
-> not this command.
+> **Capability level: v1 (control-backed).** The stop channel is the durable
+> stop-request in `.regent/control.json`; suspension is a CAS transition with a full
+> resume payload. Still absent: daemon and real in-flight `--abort` — immediate
+> interruption of a running step is the user's Esc, and this command normalizes state at
+> the next message boundary.
 
 ## Steps
 
-1. Locate the state roots and the single open activity exactly as `/regent` does (its
-   sections 0–1: brainstorm round without DECISION, plan without APPROVAL, or build without
-   CONCLUSION; legacy PT scheme respected; ambiguity = report and stop, touch nothing).
-   Nothing open → report that the state is clean (nothing to stop) and stop.
-2. Write `SUSPENSION.md` (legacy hosts: `SUSPENSAO.md`) inside the open activity dir with:
-   timestamp, reason given by the owner (ask if not stated), and the resume checkpoint —
-   for brainstorm/plan: which artifact was pending; for build: the current step and its
-   phase (IMPLEMENTING / GATE-RED / GATE-GREEN-UNCOMMITTED / COMMITTED) plus any in-flight
-   consultation outcome.
-3. Persist everything already produced — never delete partial artifacts; they are evidence.
-   A build step in IMPLEMENTING phase keeps its uncommitted worktree changes untouched;
-   record in SUSPENSION.md that the worktree is intentionally dirty.
-4. Make an operational commit of ONLY regent-owned paths (`.regent/`, the `.claude/` symlink
-   integrations, and — in the regent repo only — `docs/`). Never commit host code from here:
-   deliberate build-step commits belong to `/regent` (REQ-005). A failed commit does NOT
-   prevent the suspension — report it and leave the commit pending.
-5. Confirm to the owner: what was suspended, at which checkpoint, and that `/regent`
-   resumes it.
+1. `regent status`. If `control` is `"uninitialized"` or `"corrupt"` → report (legacy v0
+   hosts: fall back to the v0 file-driven suspension rules) and stop. If
+   `control.activity` is null → report clean state, nothing to stop. If already
+   `SUSPENDED` → report where it is suspended (checkpoint) and stop.
+2. Record the durable request: `regent stop request` (mediator channel; a suspended
+   activity answers `noop: true`). This alone already makes any running `/regent` flow
+   suspend at its next boundary — if one is running, let it.
+3. If YOU are normalizing (no flow running): persist any partial artifacts (they are
+   evidence — never delete), then
+   `regent activity suspend --checkpoint "<exact resume point>" --reason "<owner's
+   reason — ask if not stated>" [--in-flight "<what was interrupted>"]
+   --evidence <path> [--evidence <path>...]`.
+4. Make an operational commit of ONLY regent-owned paths (`.regent/` including
+   `control.json` and `protocol/audit.jsonl`, plus — in the regent repo only — `docs/`).
+   Never commit host code from here: deliberate build-step commits belong to `/regent`
+   (REQ-005). A failed commit does NOT prevent the suspension — report it and leave the
+   commit pending.
+5. Confirm to the owner: what was suspended, the exact checkpoint, and that `/regent`
+   resumes it (`regent activity resume` returns the checkpoint and verifies evidence).
+
+Error codes you may see: `NO_ACTIVITY` (nothing to stop), `NOT_ACTIVE` (already
+suspended), `TOKEN_MISMATCH`/`LOCK_SUSPECT` (mediated recovery — see /regent §0),
+`CORRUPT_CONTROL` (stop and report).
