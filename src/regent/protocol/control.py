@@ -45,7 +45,7 @@ _TURN_KEYS = {"owner", "token", "acquired_at"}
 _SUSPENSION_KEYS = {"previous_state", "checkpoint", "owning_turn", "in_flight",
                     "reason", "at"}
 _REQUEST_KEYS = {"id", "activity_id", "activity_epoch", "turn_token", "requested_at"}
-_CONCLUDED_KEYS = {"type", "id", "status", "at"}
+_CONCLUDED_KEYS = {"type", "id", "status", "epoch", "at"}
 
 
 class ControlSchemaError(ValueError):
@@ -89,12 +89,26 @@ def _require_str(value: Any, label: str) -> None:
         raise ControlSchemaError(f"{label} must be a non-empty string")
 
 
+def _require_int(value: Any, label: str, *, minimum: int = 0) -> None:
+    # bool is an int subclass in Python; the schema means actual integers.
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ControlSchemaError(f"{label} must be an int >= {minimum}")
+
+
+def _require_token(value: Any, label: str) -> None:
+    _require_str(value, label)
+    if len(value) != 32 or any(c not in "0123456789abcdef" for c in value):
+        raise ControlSchemaError(f"{label} must be a uuid4 hex token (32 hex chars)")
+
+
 def _require_timestamp(value: Any, label: str) -> None:
     _require_str(value, label)
     try:
-        datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         raise ControlSchemaError(f"{label} is not an ISO-8601 timestamp: {value!r}") from None
+    if parsed.tzinfo is None:
+        raise ControlSchemaError(f"{label} must be timezone-aware (UTC): {value!r}")
 
 
 def validate_control(control: Mapping[str, Any]) -> None:
@@ -103,8 +117,7 @@ def validate_control(control: Mapping[str, Any]) -> None:
     _require_keys(control, _TOP_KEYS, "control")
     if control["schema_version"] != SCHEMA_VERSION:
         raise ControlSchemaError(f"unknown schema_version: {control['schema_version']!r}")
-    if not isinstance(control["version"], int) or control["version"] < 0:
-        raise ControlSchemaError("version must be a non-negative int")
+    _require_int(control["version"], "version")
     _require_timestamp(control["updated_at"], "updated_at")
 
     activity = control["activity"]
@@ -113,8 +126,7 @@ def validate_control(control: Mapping[str, Any]) -> None:
         if activity["type"] not in ACTIVITY_TYPES:
             raise ControlSchemaError(f"unknown activity type: {activity['type']!r}")
         _require_str(activity["id"], "activity.id")
-        if not isinstance(activity["epoch"], int) or activity["epoch"] < 0:
-            raise ControlSchemaError("activity.epoch must be a non-negative int")
+        _require_int(activity["epoch"], "activity.epoch")
         state = activity["state"]
         if state not in ACTIVITY_STATES:
             raise ControlSchemaError(f"unknown activity state: {state!r}")
@@ -127,12 +139,13 @@ def validate_control(control: Mapping[str, Any]) -> None:
             _require_keys(turn, _TURN_KEYS, "activity.turn")
             if turn["owner"] != "executor":
                 raise ControlSchemaError("turn.owner must be 'executor' (REQ-003)")
-            _require_str(turn["token"], "turn.token")
+            _require_token(turn["token"], "turn.token")
             _require_timestamp(turn["acquired_at"], "turn.acquired_at")
         if suspension is not None:
             _require_keys(suspension, _SUSPENSION_KEYS, "activity.suspension")
-            for key in ("previous_state", "checkpoint", "owning_turn", "reason"):
+            for key in ("previous_state", "checkpoint", "reason"):
                 _require_str(suspension[key], f"suspension.{key}")
+            _require_token(suspension["owning_turn"], "suspension.owning_turn")
             if suspension["in_flight"] is not None:
                 _require_str(suspension["in_flight"], "suspension.in_flight")
             _require_timestamp(suspension["at"], "suspension.at")
@@ -140,12 +153,11 @@ def validate_control(control: Mapping[str, Any]) -> None:
     request = control["stop_request"]
     if request is not None:
         _require_keys(request, _REQUEST_KEYS, "stop_request")
-        _require_str(request["id"], "stop_request.id")
+        _require_token(request["id"], "stop_request.id")
         _require_str(request["activity_id"], "stop_request.activity_id")
-        if not isinstance(request["activity_epoch"], int):
-            raise ControlSchemaError("stop_request.activity_epoch must be an int")
+        _require_int(request["activity_epoch"], "stop_request.activity_epoch")
         if request["turn_token"] is not None:
-            _require_str(request["turn_token"], "stop_request.turn_token")
+            _require_token(request["turn_token"], "stop_request.turn_token")
         _require_timestamp(request["requested_at"], "stop_request.requested_at")
 
     concluded = control["last_concluded"]
@@ -153,6 +165,7 @@ def validate_control(control: Mapping[str, Any]) -> None:
         _require_keys(concluded, _CONCLUDED_KEYS, "last_concluded")
         for key in ("type", "id", "status"):
             _require_str(concluded[key], f"last_concluded.{key}")
+        _require_int(concluded["epoch"], "last_concluded.epoch")
         _require_timestamp(concluded["at"], "last_concluded.at")
 
 
@@ -220,17 +233,24 @@ class ControlStore:
             control["updated_at"] = utcnow()
             validate_control(control)
             self._check_epoch_monotonic(current, control)
-            mutex.verify_still_held()  # belt-and-suspenders before publishing
-            self._publish(control)
+            self._publish(control, mutex=mutex)
             return control
 
     def mutate(self, fn: Callable[[dict[str, Any]], dict[str, Any]], *,
                turn_token: str | None = None, retries: int = 10) -> dict[str, Any]:
-        """Retry-on-conflict convenience: fn(current) -> new control body."""
+        """Retry-on-conflict convenience: fn(current) -> new control body.
+
+        True no-op guarantee: if fn returns the body semantically unchanged
+        (e.g. an equivalent transition raced in), nothing is published — the
+        version and updated_at stay put."""
         for _ in range(retries):
             current = self.load()
+            new_body = fn(json.loads(json.dumps(current)))  # deep copy for fn
+            unchanged = {k: v for k, v in new_body.items()} == current
+            if unchanged:
+                return current
             try:
-                return self.cas_write(current["version"], fn(dict(current)),
+                return self.cas_write(current["version"], new_body,
                                       turn_token=turn_token)
             except VersionConflict:
                 time.sleep(0.02)
@@ -244,12 +264,28 @@ class ControlStore:
     @staticmethod
     def _check_epoch_monotonic(current: Mapping[str, Any],
                                new: Mapping[str, Any]) -> None:
-        current_activity, new_activity = current.get("activity"), new.get("activity")
-        if current_activity is not None and new_activity is not None:
-            if new_activity["epoch"] < current_activity["epoch"]:
+        """Epoch never regresses — INCLUDING through the idle cycle: the floor
+        survives activity=null via last_concluded.epoch, and (re)starting from
+        idle demands a STRICTLY greater epoch (ABA guard)."""
+        new_activity = new.get("activity")
+        if new_activity is None:
+            return
+        current_activity = current.get("activity")
+        floors = [a["epoch"] for a in (current_activity,) if a is not None]
+        concluded = current.get("last_concluded")
+        if concluded is not None:
+            floors.append(concluded["epoch"])
+        if not floors:
+            return
+        floor = max(floors)
+        if current_activity is None:
+            if new_activity["epoch"] <= floor:
                 raise ControlSchemaError(
-                    f"activity.epoch must not decrease "
-                    f"({current_activity['epoch']} -> {new_activity['epoch']})")
+                    f"starting from idle requires epoch > {floor} "
+                    f"(got {new_activity['epoch']})")
+        elif new_activity["epoch"] < floor:
+            raise ControlSchemaError(
+                f"activity.epoch must not decrease ({floor} -> {new_activity['epoch']})")
 
     def _clean_orphan_tempfiles(self) -> None:
         for orphan in self._path.parent.glob(_TMP_PREFIX + "*"):
@@ -258,7 +294,8 @@ class ControlStore:
             except OSError:
                 pass
 
-    def _publish(self, control: Mapping[str, Any]) -> None:
+    def _publish(self, control: Mapping[str, Any],
+                 mutex: "_MutationMutex | None" = None) -> None:
         tmp = self._path.with_name(f"{_TMP_PREFIX}{uuid.uuid4().hex}")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
@@ -268,6 +305,11 @@ class ControlStore:
                 os.fsync(handle.fileno())
             if _CRASH_BEFORE_REPLACE:  # test hook: simulated crash
                 os._exit(42)
+            if mutex is not None:
+                # Coupled to publication: the ownership check is the LAST thing
+                # before os.replace, so a displaced holder aborts here instead
+                # of double-publishing.
+                mutex.verify_still_held()
             os.replace(tmp, self._path)
             dir_fd = os.open(self._path.parent, os.O_RDONLY)
             try:
@@ -320,7 +362,11 @@ class _MutationMutex:
         return self
 
     def __exit__(self, *exc_info):
-        self._remove(self._dir)
+        # Token-conditional removal: NEVER delete a mutex instance that is not
+        # ours (we may have been evicted and a fresh holder may own the path).
+        meta = self._read_meta(self._dir)
+        if meta is not None and meta.get("token") == self._token:
+            self._remove(self._dir)
         return False
 
     def verify_still_held(self) -> None:
@@ -351,6 +397,11 @@ class _MutationMutex:
         self._audit.append({"event": "mutation_mutex_recovered",
                             "mutex": str(self._dir), "reason": stale_reason,
                             "evicted_token": judged_token})
+        # Re-check the canonical instance right before claiming: if the judged
+        # (dead) instance was already replaced by a fresh one, do not touch it.
+        recheck = self._read_meta(self._dir)
+        if (recheck or {}).get("token") != judged_token:
+            return
         aside = self._dir.with_name(self._dir.name + f".evict-{uuid.uuid4().hex}")
         try:
             os.rename(self._dir, aside)  # atomic claim: one recoverer wins

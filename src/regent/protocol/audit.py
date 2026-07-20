@@ -2,12 +2,15 @@
 
 Shareable evidence per REQ-001 §3: takeovers, stale-mutex recoveries and
 stop-request discards are auditable artifacts, so they live inside the repo,
-never only in disposable local state. Each append is a single-line O_APPEND
-write followed by fsync — durable and safe under concurrent writers.
+never only in disposable local state. Concurrency: appends are serialized by
+an exclusive flock on the file (O_APPEND alone does not protect against a
+PARTIAL os.write interleaving with another writer's fragments). Durability:
+fsync of the file AND of its directory on every append.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from datetime import datetime, timezone
@@ -33,12 +36,13 @@ class AuditLog:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # no fragment interleaving across writers
             written = 0
             while written < len(payload):  # os.write may be partial
                 written += os.write(fd, payload[written:])
             os.fsync(fd)
         finally:
-            os.close(fd)
+            os.close(fd)  # closing releases the flock
         dir_fd = os.open(self._path.parent, os.O_RDONLY)
         try:
             os.fsync(dir_fd)  # durability of the entry ON FIRST CREATION too

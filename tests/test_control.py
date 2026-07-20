@@ -23,7 +23,7 @@ def _cas_writer(root: str, barrier, queue) -> None:
     try:
         body = store.load()
         body["last_concluded"] = {"type": "plan", "id": f"PLAN-{os.getpid()}",
-                                  "status": "ACCEPTED", "at": "2026-01-01T00:00:00+00:00"}
+                                  "status": "ACCEPTED", "epoch": 1, "at": "2026-01-01T00:00:00+00:00"}
         store.cas_write(0, body)
         queue.put("ok")
     except VersionConflict:
@@ -35,14 +35,14 @@ def _mutating_writer(root: str, field_id: str, barrier) -> None:
     barrier.wait()
     if field_id == "stop":
         def fn(body):
-            body["stop_request"] = {"id": "req-1", "activity_id": "PLAN-001",
+            body["stop_request"] = {"id": "a1" * 16, "activity_id": "PLAN-001",
                                     "activity_epoch": 1, "turn_token": None,
                                     "requested_at": "2026-01-01T00:00:00+00:00"}
             return body
     else:
         def fn(body):
             body["last_concluded"] = {"type": "plan", "id": "PLAN-000",
-                                      "status": "ACCEPTED", "at": "2026-01-01T00:00:00+00:00"}
+                                      "status": "ACCEPTED", "epoch": 1, "at": "2026-01-01T00:00:00+00:00"}
             return body
     store.mutate(fn, retries=50)
 
@@ -53,7 +53,7 @@ def _crashing_writer(root: str) -> None:
     store = _store(Path(root))
     body = store.load()
     body["last_concluded"] = {"type": "plan", "id": "PLAN-CRASH",
-                              "status": "ACCEPTED", "at": "2026-01-01T00:00:00+00:00"}
+                              "status": "ACCEPTED", "epoch": 1, "at": "2026-01-01T00:00:00+00:00"}
     store.cas_write(0, body)  # os._exit(42) fires before os.replace
 
 
@@ -62,6 +62,14 @@ def _audit_appender(root: str, worker: int, barrier) -> None:
     barrier.wait()
     for i in range(25):
         log.append({"event": "concurrency", "worker": worker, "seq": i})
+
+
+def _touch(body):
+    """A REAL mutation (mutate() skips publishing unchanged bodies)."""
+    body["last_concluded"] = {"type": "plan", "id": "PLAN-TOUCH",
+                              "status": "ACCEPTED", "epoch": 1,
+                              "at": "2026-01-01T00:00:00+00:00"}
+    return body
 
 
 class ControlStoreTest(unittest.TestCase):
@@ -125,7 +133,7 @@ class ControlStoreTest(unittest.TestCase):
         proc = mp.Process(target=_crashing_writer, args=(str(self.root),))
         proc.start()
         proc.join(timeout=15)
-        control = self.store.mutate(lambda body: body)  # crashed mutex must not block
+        control = self.store.mutate(_touch)  # crashed mutex must not block
         self.assertEqual(control["version"], 1)
 
     def test_mutation_mutex_stale_recovered_after_crash(self):
@@ -135,7 +143,7 @@ class ControlStoreTest(unittest.TestCase):
             json.dumps({"pid": 99999999, "at": "2026-01-01T00:00:00+00:00",
                         "token": "dead-holder"}),
             encoding="utf-8")
-        control = self.store.mutate(lambda body: body)
+        control = self.store.mutate(_touch)
         self.assertEqual(control["version"], 1)
         events = [r["event"] for r in AuditLog(self.root / "audit.jsonl").read_all()]
         self.assertIn("mutation_mutex_recovered", events)
@@ -152,16 +160,38 @@ class ControlStoreTest(unittest.TestCase):
                                  mutation_timeout=0.2)
         from regent.protocol.control import MutationMutexBusy
         with self.assertRaises((MutationMutexBusy, VersionConflict)):
-            impatient.mutate(lambda body: body, retries=1)
+            impatient.mutate(_touch, retries=1)
         self.assertEqual(self.store.load()["version"], 0)  # nothing was published
         self.assertTrue((mutex / "meta.json").exists())  # holder NOT evicted
         events = [r["event"] for r in AuditLog(self.root / "audit.jsonl").read_all()]
         self.assertNotIn("mutation_mutex_recovered", events)
 
+    def test_epoch_monotonic_through_idle_cycle(self):
+        token = "ef" * 16
+        active = initial_control()
+        active["activity"] = {"type": "build", "id": "PLAN-009", "epoch": 10,
+                              "state": "ACTIVE", "suspension": None,
+                              "turn": {"owner": "executor", "token": token,
+                                       "acquired_at": "2026-01-01T00:00:00+00:00"}}
+        self.store.cas_write(0, active)
+        concluded = initial_control()
+        concluded["activity"] = None
+        concluded["last_concluded"] = {"type": "build", "id": "PLAN-009",
+                                       "status": "ACCEPTED", "epoch": 10,
+                                       "at": "2026-01-01T00:00:00+00:00"}
+        self.store.cas_write(1, concluded)
+
+        reborn = dict(self.store.load())
+        reborn["activity"] = dict(active["activity"], epoch=1)  # ABA attempt
+        with self.assertRaises(ControlSchemaError):
+            self.store.cas_write(2, reborn)
+        reborn["activity"] = dict(active["activity"], epoch=11)  # strictly greater
+        self.store.cas_write(2, reborn)
+
     def test_orphan_tempfiles_cleaned(self):
         orphan = self.root / ".control-tmp-deadbeef"
         orphan.write_text("junk", encoding="utf-8")
-        self.store.mutate(lambda body: body)
+        self.store.mutate(_touch)
         self.assertFalse(orphan.exists())
 
     def test_audit_append_fsynced_and_concurrent(self):

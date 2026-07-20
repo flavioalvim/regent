@@ -9,7 +9,7 @@ from regent.protocol.control import (ControlStore, NotLockOwner, initial_control
 from regent.protocol.stop import (read_valid_stop_request, record_stop_request,
                                   suspend_activity)
 
-TOKEN = "token-current"
+TOKEN = "ab" * 16
 
 
 class StopRequestTest(unittest.TestCase):
@@ -43,7 +43,7 @@ class StopRequestTest(unittest.TestCase):
     def test_mediator_stop_request_null_token_valid(self):
         record_stop_request(self.store, turn_token=None)
         self.assertIsNotNone(read_valid_stop_request(self.store))
-        self._rotate_turn("token-after-takeover")  # mediator channel survives takeover
+        self._rotate_turn("cd" * 16)  # mediator channel survives takeover
         self.assertIsNotNone(read_valid_stop_request(self.store))
 
     def test_stale_stop_request_discarded_with_audit(self):
@@ -56,7 +56,7 @@ class StopRequestTest(unittest.TestCase):
 
     def test_stop_request_old_turn_token_stale_after_takeover(self):
         record_stop_request(self.store, turn_token=TOKEN)
-        self._rotate_turn("token-after-takeover")
+        self._rotate_turn("cd" * 16)
         self.assertIsNone(read_valid_stop_request(self.store))
         events = [r for r in self.audit.read_all() if r["event"] == "stop_request_discarded"]
         self.assertEqual(len(events), 1)
@@ -93,7 +93,7 @@ class StopRequestTest(unittest.TestCase):
                                           checkpoint="STEP-02", reason="stop"))
         self.assertEqual(self.store.load()["version"], version_after_suspend)  # true no-op
         with self.assertRaises(NotLockOwner):  # re-apply demands the suspending turn
-            suspend_activity(self.store, turn_token="another-token",
+            suspend_activity(self.store, turn_token="ee" * 16,
                              checkpoint="STEP-02", reason="stop")
         self.assertEqual(self.store.load()["activity"]["state"], "SUSPENDED")
 

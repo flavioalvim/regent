@@ -87,10 +87,13 @@ class TurnLockTest(unittest.TestCase):
                  for _ in range(2)]
         for p in procs:
             p.start()
-        outcomes = sorted(queue.get(timeout=15)[0] for _ in procs)
+        results = sorted((queue.get(timeout=15) for _ in procs), key=lambda r: r[0])
         for p in procs:
             p.join(timeout=15)
-        self.assertEqual(outcomes, ["lost", "won"])
+        self.assertEqual([r[0] for r in results], ["lost", "won"])
+        winner_token = dict(results)["won"]
+        owner = json.loads((seed.path / "owner.json").read_text(encoding="utf-8"))
+        self.assertEqual(owner["token"], winner_token)  # winner IS the final owner
 
     def test_acquire_leaves_regent_and_git_untouched(self):
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
