@@ -16,8 +16,10 @@ description: Safely stop/suspend the regent activity in progress (brainstorm rou
 1. `regent status`. If `control` is `"uninitialized"` or `"corrupt"` → report (legacy v0
    hosts: fall back to the v0 file-driven suspension rules) and stop. If
    `control.activity` is null → report clean state, nothing to stop. If already
-   `SUSPENDED` → report where it is suspended (checkpoint) and stop.
-2. Record the durable request: `regent stop request` (mediator channel; a suspended
+   `SUSPENDED` → report where it is suspended (the activity object in `status` carries
+   `checkpoint` and `reason`) and stop.
+2. Record the durable request: `regent stop request --reason "<the owner reason>"`
+   (mediator channel; a suspended
    activity answers `noop: true`). This alone already makes any running `/regent` flow
    suspend at its next boundary — if one is running, let it.
 3. If YOU are normalizing (no flow running): persist any partial artifacts (they are

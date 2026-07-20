@@ -44,7 +44,8 @@ _ACTIVITY_KEYS = {"type", "id", "epoch", "state", "turn", "suspension"}
 _TURN_KEYS = {"owner", "token", "acquired_at"}
 _SUSPENSION_KEYS = {"previous_state", "checkpoint", "owning_turn", "in_flight",
                     "reason", "evidence", "at"}
-_REQUEST_KEYS = {"id", "activity_id", "activity_epoch", "turn_token", "requested_at"}
+_REQUEST_KEYS = {"id", "activity_id", "activity_epoch", "turn_token",
+                 "reason", "requested_at"}
 _CONCLUDED_KEYS = {"type", "id", "status", "epoch", "at"}
 
 
@@ -163,6 +164,8 @@ def validate_control(control: Mapping[str, Any]) -> None:
         _require_int(request["activity_epoch"], "stop_request.activity_epoch")
         if request["turn_token"] is not None:
             _require_token(request["turn_token"], "stop_request.turn_token")
+        if request["reason"] is not None:
+            _require_str(request["reason"], "stop_request.reason")
         _require_timestamp(request["requested_at"], "stop_request.requested_at")
 
     concluded = control["last_concluded"]

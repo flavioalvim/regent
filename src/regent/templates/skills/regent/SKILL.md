@@ -20,7 +20,8 @@ Run `regent status` (pure JSON). Decide from it:
 - `workspace.verdict` is the executable control×files matrix. Only `OK`, `SUSPENDED_OK`
   and `IDLE_CLEAN` proceed. Anything else (`ORPHAN_NO_DIR`, `ORPHAN_WITH_OTHER_OPEN`,
   `SUSPENDED_ORPHAN`, `TYPE_MISMATCH`, `SECOND_ARTIFACT`, `TERMINAL_EXISTS`,
-  `MULTIPLE_OPEN`, `LEGACY_OPEN_ARTIFACT`) → report the verdict and ASK THE MEDIATOR.
+  `MULTIPLE_OPEN`, `LEGACY_OPEN_ARTIFACT`, `MULTIPLE_SCHEMES`) → report the verdict and
+  ASK THE MEDIATOR.
   Never adopt, repair or delete silently.
 - `lock` problems surface as error codes when you act: `LOCK_SUSPECT` (or an ACTIVE
   control with a free lock) → the recovery is MEDIATED: ask the owner, then
@@ -50,7 +51,8 @@ non-empty, report it before continuing). Continue exactly at that checkpoint.
 At EVERY named boundary — before producing each round/plan artifact, and between the
 phases of each build step (implement → gate → record → commit) — run:
 `regent stop check` and `regent activity heartbeat`.
-If `stop_requested` is true: finish ONLY the current sub-step's evidence, then
+If `stop_requested` is true (the request carries `reason` — use it): finish ONLY the
+current sub-step's evidence, then
 `regent activity suspend --checkpoint "<exact resume point>" --reason "<from request>"
 [--in-flight "<what was running>"] --evidence <path> [--evidence <path>...]` and confirm
 to the owner. The checkpoint string must be precise enough for section 2 to resume from.
@@ -67,8 +69,10 @@ executable gate) → advisor review (+1 rebuttal cycle) → `APPROVAL.md`
 
 **Build** (REQ-005 protocol, unchanged in content): baseline → per step: clean worktree
 (the exempted operational files `control.json`/`audit.jsonl` may be dirty — they are
-staged into the commit that closes the current boundary, and any change in them the
-current operation does NOT explain is a failure) → implement → run the gate for real →
+staged into the commit that closes the current boundary; record `control.version` from
+`regent status` at step start, and BEFORE staging them run `regent control explain`:
+exit 0 = explained operational churn, `UNATTRIBUTABLE` = the step commit MUST fail) →
+implement → run the gate for real →
 `build/STEP-NN.md` → deliberate commit with trailer `Regent-Step: PLAN-NNN/STEP-NN` →
 final advisor review over `BASE-SHA..HEAD` → `build/CONCLUSION.md` (status + actor) →
 `regent activity conclude --status <conclusion status>`.

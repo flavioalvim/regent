@@ -22,7 +22,8 @@ from .audit import utcnow
 from .control import ControlSchemaError, ControlStore
 
 
-def record_stop_request(store: ControlStore, *, turn_token: str | None = None) -> dict:
+def record_stop_request(store: ControlStore, *, turn_token: str | None = None,
+                        reason: str | None = None) -> dict:
     """Records a stop request bound to the current activity. Idempotent as a
     TRUE no-op: an equivalent pending request (same activity/epoch/token) is
     returned as-is WITHOUT bumping the control version."""
@@ -49,6 +50,7 @@ def record_stop_request(store: ControlStore, *, turn_token: str | None = None) -
                    "activity_id": activity["id"],
                    "activity_epoch": activity["epoch"],
                    "turn_token": turn_token,
+                   "reason": reason,
                    "requested_at": utcnow()}
         body["stop_request"] = request
         result.update(request)

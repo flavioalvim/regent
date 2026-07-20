@@ -15,6 +15,7 @@ KNOWN_SUBCOMMANDS = {
     "regent activity start", "regent activity resume", "regent activity suspend",
     "regent activity conclude", "regent activity heartbeat",
     "regent activity takeover", "regent stop request", "regent stop check",
+    "regent control explain",
 }
 
 
@@ -29,7 +30,7 @@ class SkillAntiDriftTest(unittest.TestCase):
         # Only COMMAND citations count: `regent ...` inside backtick spans.
         for name, text in _templates().items():
             for span in re.findall(r"`([^`]*)`", text.replace("\n", " ")):
-                match = re.match(r"regent (?:(activity|stop) )?([a-z-]+)", span)
+                match = re.match(r"regent (?:(activity|stop|control) )?([a-z-]+)", span)
                 if not match:
                     continue
                 group, word = match.group(1), match.group(2)

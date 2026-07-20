@@ -81,6 +81,8 @@ def _existing_state(kind: str, path: Path, payload: str,
             return "identical"  # valid at ANY evolved version = no-op
         except ControlSchemaError:
             return "divergent"
+    if path.is_symlink():
+        return "divergent"  # never follow/overwrite a symlinked skill target
     if not path.exists():
         return "absent"
     if not path.is_file():
@@ -134,9 +136,9 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
             if kind == "file":
                 if states[path] == "upgradeable":
                     replaced.append((path, path.read_bytes()))
-                    path.write_text(payload, encoding="utf-8")
+                    _atomic_write(path, payload)
                 else:
-                    path.write_text(payload, encoding="utf-8")
+                    _atomic_write(path, payload)
                     created.append(path)
             elif kind == "symlink":
                 path.symlink_to(payload)
@@ -171,10 +173,20 @@ def _missing_parents(path: Path) -> list[Path]:
     return list(reversed(missing))
 
 
+def _atomic_write(path: Path, payload: str) -> None:
+    import os
+    tmp = path.with_name(path.name + ".regent-tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _rollback(created: list[Path], replaced: list[tuple[Path, bytes]]) -> None:
+    import os
     for path, original in replaced:
         try:
-            path.write_bytes(original)
+            tmp = path.with_name(path.name + ".regent-tmp")
+            tmp.write_bytes(original)
+            os.replace(tmp, path)
         except OSError:
             pass
     for path in reversed(created):

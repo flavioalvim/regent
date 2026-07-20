@@ -30,6 +30,7 @@ from typing import Any
 from .protocol import (AuditLog, ControlStore, NotLockOwner, TurnLock,
                        record_stop_request, read_valid_stop_request,
                        suspend_activity)
+from .protocol.control import _FlockMutex
 from .protocol.audit import utcnow
 from .protocol.control import ACTIVITY_TYPES, ControlSchemaError
 
@@ -42,7 +43,7 @@ def _maybe_crash(point: str) -> None:
 
 
 class ActivityError(Exception):
-    code = "ACTIVITY"
+    code = "USAGE"  # subclasses override; base = caller misuse
 
     def __init__(self, detail: Any = None, message: str | None = None) -> None:
         super().__init__(message or self.code)
@@ -91,10 +92,55 @@ class ActivityService:
                                   lock_file=self.state_dir / "control.lock")
         self.lock = TurnLock(self.state_dir, self.audit)
         self.token_file = self.state_dir / "turn.json"
+        # PLAN-002 STEP-06 (advisor blocker 1): composed operations are
+        # serialized per host under a dedicated ops flock — recover→acquire→
+        # CAS→turn.json is one unit; another process can never misread an
+        # in-flight start as a crashed row-8 state and release its lock.
+        self._ops_lock = self.state_dir / "ops.lock"
+
+    def _ops_mutex(self) -> _FlockMutex:
+        return _FlockMutex(self._ops_lock, 60.0)
+
+    # -- public operations: each composed op is ONE serialized unit ---------
+
+    def start(self, activity_type: str, activity_id: str) -> dict:
+        with self._ops_mutex():
+            return self._start_locked(activity_type, activity_id)
+
+    def resume(self, activity_id: str | None = None) -> dict:
+        with self._ops_mutex():
+            return self._resume_locked(activity_id)
+
+    def suspend(self, **kwargs) -> dict:
+        with self._ops_mutex():
+            return self._suspend_locked(**kwargs)
+
+    def conclude(self, status: str) -> dict:
+        with self._ops_mutex():
+            return self._conclude_locked(status)
+
+    def heartbeat(self) -> dict:
+        with self._ops_mutex():
+            return self._heartbeat_locked()
+
+    def takeover(self, **kwargs) -> dict:
+        with self._ops_mutex():
+            return self._takeover_locked(**kwargs)
+
+    def stop_request(self, reason: str | None = None) -> dict:
+        with self._ops_mutex():
+            return self._stop_request_locked(reason)
+
+    def stop_check(self) -> dict:
+        with self._ops_mutex():
+            return self._stop_check_locked()
+
+    def status(self) -> dict:
+        return self._status_locked()  # read-only; no mutation to serialize
 
     # -- public operations -------------------------------------------------
 
-    def start(self, activity_type: str, activity_id: str) -> dict:
+    def _start_locked(self, activity_type: str, activity_id: str) -> dict:
         if activity_type not in ACTIVITY_TYPES:
             raise ActivityError({"type": activity_type}, "unknown activity type")
         control = self._recover()
@@ -114,7 +160,7 @@ class ActivityService:
         return {"activity": _activity_obj(control["activity"]), "token": token,
                 "checkpoint": None}
 
-    def resume(self, activity_id: str | None = None) -> dict:
+    def _resume_locked(self, activity_id: str | None = None) -> dict:
         control = self._recover()
         activity = control["activity"]
         if activity is None:
@@ -122,14 +168,18 @@ class ActivityService:
         if activity["state"] != "SUSPENDED":
             raise NotSuspended({"state": activity["state"]})
         if activity_id is not None and activity["id"] != activity_id:
-            raise ActivityError({"open": activity["id"], "asked": activity_id},
-                                "a DIFFERENT activity is suspended")
+            raise ActivityOpen({"activity": _activity_obj(activity),
+                                "asked": activity_id})
         suspension = activity["suspension"]
         token = self.lock.acquire()
         _maybe_crash("resume:after_lock")
         epoch = self._floor(control) + 1  # every (re)start increments (PLAN-001)
 
         def fn(body: dict) -> dict:
+            current = body.get("activity")
+            if current is None or current["state"] != "SUSPENDED" \
+                    or current["id"] != activity["id"]:
+                return body  # raced: do NOT overwrite; caller re-inspects
             body["activity"] = {"type": activity["type"], "id": activity["id"],
                                 "epoch": epoch, "state": "ACTIVE",
                                 "suspension": None,
@@ -138,6 +188,10 @@ class ActivityService:
             return body
 
         control = self.store.mutate(fn)
+        if (control["activity"] or {}).get("turn", {}).get("token") != token:
+            self._release_quietly(token)
+            raise NotSuspended({"state": (control["activity"] or {}).get("state",
+                                                                          "idle")})
         _maybe_crash("resume:after_cas")
         self._write_local_token(token)
         missing = [p for p in suspension.get("evidence", [])
@@ -146,7 +200,7 @@ class ActivityService:
                 "checkpoint": suspension["checkpoint"],
                 "missing_evidence": missing}
 
-    def suspend(self, *, checkpoint: str, reason: str,
+    def _suspend_locked(self, *, checkpoint: str, reason: str,
                 in_flight: str | None = None,
                 evidence: list[str] | None = None) -> dict:
         control = self._recover()
@@ -159,14 +213,14 @@ class ActivityService:
         suspend_activity(self.store, turn_token=token, checkpoint=checkpoint,
                          reason=reason, in_flight=in_flight, evidence=evidence)
         _maybe_crash("suspend:after_cas")
-        self._release_quietly(token)
+        self.lock.release(token)  # strict: a failed release surfaces (STEP-06)
         _maybe_crash("suspend:before_token_cleanup")
         self._clear_local_token()
         control = self.store.load()
         return {"activity": _activity_obj(control["activity"]),
                 "checkpoint": checkpoint}
 
-    def conclude(self, status: str) -> dict:
+    def _conclude_locked(self, status: str) -> dict:
         control = self._recover()
         activity = control["activity"]
         if activity is None:
@@ -185,12 +239,12 @@ class ActivityService:
 
         control = self.store.mutate(fn, turn_token=token)
         _maybe_crash("conclude:after_cas")
-        self._release_quietly(token)
+        self.lock.release(token)  # strict: a failed release surfaces (STEP-06)
         _maybe_crash("conclude:before_token_cleanup")
         self._clear_local_token()
         return {"last_concluded": control["last_concluded"]}
 
-    def heartbeat(self) -> dict:
+    def _heartbeat_locked(self) -> dict:
         self._recover()
         token = self._read_local_token()
         if token is None:
@@ -198,30 +252,35 @@ class ActivityService:
         self.lock.heartbeat(token)
         return {"heartbeat_at": utcnow()}
 
-    def takeover(self, *, reason: str, actor: str = "mediator") -> dict:
+    def _takeover_locked(self, *, reason: str, actor: str = "mediator") -> dict:
         control = self.store.load()
         activity = control.get("activity")
-        previous = ((activity or {}).get("turn") or {}).get("token")
+        if activity is None:
+            raise NoActivity({"state": "idle"})
+        if activity["state"] != "ACTIVE":
+            raise NotActive({"state": activity["state"]})
+        previous = (activity.get("turn") or {}).get("token")
         token = self.lock.takeover(actor=actor, reason=reason,
                                    control_store=self.store)
         self._write_local_token(token)
         return {"token": token, "previous_owner": previous}
 
-    def stop_request(self) -> dict:
+    def _stop_request_locked(self, reason: str | None = None) -> dict:
         control = self._recover()
         activity = control["activity"]
         if activity is None:
             raise NoActivity({"state": "idle"})
         if activity["state"] == "SUSPENDED":  # normalized no-op (PLAN-002)
             return {"request": None, "noop": True}
-        return {"request": record_stop_request(self.store, turn_token=None),
+        return {"request": record_stop_request(self.store, turn_token=None,
+                                               reason=reason),
                 "noop": False}
 
-    def stop_check(self) -> dict:
+    def _stop_check_locked(self) -> dict:
         request = read_valid_stop_request(self.store)
         return {"stop_requested": request is not None, "request": request}
 
-    def status(self) -> dict:
+    def _status_locked(self) -> dict:
         activity = None
         try:
             control = self.store.load()
@@ -321,13 +380,13 @@ class ActivityService:
         return max(values)
 
     def _release_quietly(self, token: str) -> None:
+        """Recovery-path release: a vanished/foreign lock (NotLockOwner,
+        StaleLock) is already the desired outcome and is audited; a REAL
+        removal failure (OSError) PROPAGATES — it is never success."""
         from .protocol import StaleLock
         try:
             self.lock.release(token)
-        except (NotLockOwner, StaleLock, OSError) as exc:
-            # Recovery path: a vanished/foreign lock is already the desired
-            # outcome; a strict-removal failure is surfaced by the next
-            # recovery pass. Audited for observability either way.
+        except (NotLockOwner, StaleLock) as exc:
             self.audit.append({"event": "release_during_recovery_skipped",
                                "token": token, "reason": repr(exc)})
 
@@ -346,41 +405,61 @@ class ActivityService:
     def _clear_local_token(self) -> None:
         try:
             self.token_file.unlink()
-        except OSError:
-            pass
+        except FileNotFoundError:
+            pass  # already clean; any OTHER failure propagates
 
 
 WORKSPACE_VERDICTS = (
     "OK", "SUSPENDED_OK", "IDLE_CLEAN",  # proceedable
     "ORPHAN_NO_DIR", "ORPHAN_WITH_OTHER_OPEN", "SUSPENDED_ORPHAN",
     "TYPE_MISMATCH", "SECOND_ARTIFACT", "TERMINAL_EXISTS", "MULTIPLE_OPEN",
-    "LEGACY_OPEN_ARTIFACT", "CORRUPT_CONTROL",  # mediator-decision rows
+    "LEGACY_OPEN_ARTIFACT", "MULTIPLE_SCHEMES", "CORRUPT_CONTROL",
 )
 
 
-def explain_control_diff(before: dict, after: dict) -> dict:
+ALLOWED_STEP_AUDIT_EVENTS = frozenset({"stop_request_discarded"})
+
+
+def explain_control_diff(before: dict, after: dict,
+                         audit_delta: list[dict] | None = None) -> dict:
     """Attributability check for the exempted operational files (PLAN-002
-    commit choreography): classifies control.json changes between a step-start
-    snapshot and commit time. `version`/`updated_at` churn and an ARRIVING
-    stop_request are explained operational mutations (the latter belongs to the
-    NEXT operational commit); any change to the activity object or to
-    last_concluded that the current operation did not perform is unexplained —
-    default-deny, the step commit must fail."""
+    commit choreography), DEFAULT-DENY: only mutations the running operation
+    can legitimately produce are explained — `version`/`updated_at` churn and
+    the ARRIVAL of a well-formed stop_request bound to the CURRENT activity
+    (it belongs to the NEXT operational commit). Everything else — activity or
+    last_concluded changes, schema_version changes, a stop_request that
+    disappeared or was replaced, or audit events outside the allowed set — is
+    unexplained and must fail the step commit."""
     explained, unexplained = [], []
     for key in ("version", "updated_at"):
         if before.get(key) != after.get(key):
             explained.append(key)
-    if before.get("stop_request") != after.get("stop_request"):
-        explained.append("stop_request")
+    if before.get("schema_version") != after.get("schema_version"):
+        unexplained.append("schema_version")
+    b_req, a_req = before.get("stop_request"), after.get("stop_request")
+    if b_req != a_req:
+        activity = after.get("activity") or before.get("activity")
+        arrival_ok = (b_req is None and isinstance(a_req, dict)
+                      and activity is not None
+                      and a_req.get("activity_id") == activity.get("id")
+                      and a_req.get("activity_epoch") == activity.get("epoch"))
+        (explained if arrival_ok else unexplained).append("stop_request")
     for key in ("activity", "last_concluded"):
         if before.get(key) != after.get(key):
             unexplained.append(key)
+    for event in (audit_delta or []):
+        if event.get("event") not in ALLOWED_STEP_AUDIT_EVENTS:
+            unexplained.append(f"audit:{event.get('event')}")
     return {"explained": explained, "unexplained": unexplained}
 
 
 def classify_workspace(activity: dict | None, open_artifacts: list[str],
                        root: Path) -> str:
     """The PLAN-002 control×files matrix, row by row (default-deny)."""
+    en_scheme = root / ".regent" / "brainstorm" / "rounds"
+    pt_scheme = root / ".regent" / "brainstorm" / "rodadas"
+    if any(en_scheme.glob("ROUND-*")) and any(pt_scheme.glob("RODADA-*")):
+        return "MULTIPLE_SCHEMES"  # REQ-005 §8: coexistence is corruption
     if activity is None:
         if not open_artifacts:
             return "IDLE_CLEAN"
@@ -428,8 +507,13 @@ def _terminal_exists(artifact_dir: Path, activity_type: str) -> bool:
 def _activity_obj(activity: dict | None) -> dict | None:
     if activity is None:
         return None
-    return {"type": activity["type"], "id": activity["id"],
-            "epoch": activity["epoch"], "state": activity["state"]}
+    obj = {"type": activity["type"], "id": activity["id"],
+           "epoch": activity["epoch"], "state": activity["state"]}
+    suspension = activity.get("suspension")
+    if suspension is not None:  # declared ActivityObj extension (STEP-06)
+        obj["checkpoint"] = suspension["checkpoint"]
+        obj["reason"] = suspension["reason"]
+    return obj
 
 
 def _set_active(body: dict, activity_type: str, activity_id: str,

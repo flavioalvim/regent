@@ -36,7 +36,7 @@ def _mutating_writer(root: str, field_id: str, barrier) -> None:
     if field_id == "stop":
         def fn(body):
             body["stop_request"] = {"id": "a1" * 16, "activity_id": "PLAN-001",
-                                    "activity_epoch": 1, "turn_token": None,
+                                    "activity_epoch": 1, "turn_token": None, "reason": None,
                                     "requested_at": "2026-01-01T00:00:00+00:00"}
             return body
     else:
