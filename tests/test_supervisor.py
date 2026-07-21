@@ -1,5 +1,6 @@
 """Directed tests for rehearse + arm/disarm + daemon (PLAN-006)."""
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -414,6 +415,35 @@ class SupervisorTest(unittest.TestCase):
             mod._fsync_dir = orig
         self.assertEqual(r["final_state"], "STEPS_COMPLETE")
         self.assertIsNone(sup._raw_arm(self.service.state_dir))  # durably gone
+
+    def test_daemon_idle_disarm_failed_when_absence_not_durable(self):
+        # advisor finding #1 (round 5): the IDLE path must run the durability
+        # barrier; a failing dir-fsync there must not be reported as clean IDLE.
+        import regent.conduction.supervisor as mod
+        orig = mod._fsync_dir
+        mod._fsync_dir = lambda p: (_ for _ in ()).throw(OSError("fsync"))
+        try:
+            r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        finally:
+            mod._fsync_dir = orig
+        self.assertEqual(r["final_state"], "DISARM_FAILED")
+
+    def test_read_arm_rejects_malformed_token(self):
+        # advisor finding #3 (round 5): a token bound by epoch/token but missing
+        # arm_id/config must NOT be returned (would KeyError past the handler).
+        activity = self.service.store.load()["activity"]
+        bad = {"plan_id": "PLAN-006", "activity_epoch": activity["epoch"],
+               "turn_token": activity["turn"]["token"]}  # no arm_id / config
+        sup._atomic_write(sup._arm_path(self.service.state_dir), json.dumps(bad))
+        self.assertIsNone(sup.read_arm(self.service))
+
+    def test_daemon_idle_on_malformed_token(self):
+        activity = self.service.store.load()["activity"]
+        bad = {"plan_id": "PLAN-006", "activity_epoch": activity["epoch"],
+               "turn_token": activity["turn"]["token"], "config": "not-a-dict"}
+        sup._atomic_write(sup._arm_path(self.service.state_dir), json.dumps(bad))
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "IDLE")  # treated as no valid arm
 
     def test_daemon_disarms_on_unexpected_failure(self):
         # advisor finding #4: a non-LoopError escaping run_loop must still disarm.

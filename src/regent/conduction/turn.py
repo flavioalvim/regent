@@ -177,7 +177,7 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
              artifact_dir: Path, linkage: str, gate_envelope: list[str] | None = None,
              timeout: float = 900.0, claude_bin: str = "claude",
              runner=None, service: ActivityService | None = None,
-             attempt: int | None = None) -> dict:
+             attempt: int | None = None, launch_precondition=None) -> dict:
     root = Path(root).resolve()
     service = service or ActivityService(root)
     artifact_dir = (root / artifact_dir).resolve() if not Path(artifact_dir).is_absolute() \
@@ -259,6 +259,15 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
         prompt = Path(prompt_file).read_text(encoding="utf-8")
         argv = launch_argv(turn, prompt=prompt, claude_bin=claude_bin)
         run = runner or SubprocessRunner()
+        # Last-moment gate BEFORE spawning the agent: the tightest point at which
+        # a caller (the daemon's arm guard) can still refuse to START — no I/O
+        # between this check and the spawn. A disarm observed here suspends the
+        # turn without ever launching; an in-flight turn remains the abort path's
+        # job (PLAN-006 declared boundary).
+        if launch_precondition is not None and not launch_precondition():
+            _stopped_suspend(service, token, "LAUNCHED",
+                             reason="launch precondition failed (disarmed)")
+            raise TurnError("DISARMED", {"phase": "LAUNCHED"})
         result = run.run(argv, cwd=str(root), timeout=timeout,
                          env=launch_env(turn), cancel=cancel)
         claude_exit = result.exit_code

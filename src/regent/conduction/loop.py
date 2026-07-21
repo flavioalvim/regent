@@ -149,7 +149,8 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
                     gate_command=gate, declared_in=declared_in, step=f"{plan_id}/{step}",
                     artifact_dir=artifact_dir, linkage=f"{plan_id}/{step}/try{attempt}",
                     gate_envelope=gate_envelope, timeout=timeout, claude_bin=claude_bin,
-                    runner=runner, service=service, attempt=attempt)
+                    runner=runner, service=service, attempt=attempt,
+                    launch_precondition=guard)  # tightest re-check before spawn
             except TurnError as exc:
                 condition = _EXC_TO_CONDITION.get(exc.code, "LOOP_CONFLICT")
                 turns.append({"step": step, "attempt": attempt, "outcome": exc.code,
@@ -214,6 +215,7 @@ _EXC_TO_CONDITION = {
     "WORKTREE_DIRTY": "LOOP_DIRTY", "PROVENANCE": "LOOP_MISCONFIGURED",
     "STEP_MISMATCH": "LOOP_MISCONFIGURED", "ARTIFACT_OUTSIDE_REGENT": "LOOP_MISCONFIGURED",
     "STEP_ALREADY_DONE": "LOOP_MISCONFIGURED", "STOPPED": "STOPPED",
+    "DISARMED": "DISARMED",
 }
 
 

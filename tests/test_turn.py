@@ -107,6 +107,25 @@ class TurnTest(unittest.TestCase):
         self.assertIn("Regent-Turn: PLAN-004/STEP-09", msg)
         self.assertTrue((self.artdir / "STEP-09.md").exists())
 
+    def test_launch_precondition_false_suspends_without_launching(self):
+        # PLAN-006 #2: the tightest re-check before spawn. A precondition that
+        # returns False must suspend the turn and NEVER launch the agent.
+        self._start_build()
+        launched = {"flag": False}
+
+        class SpyRunner:
+            def run(self, *a, **k):
+                launched["flag"] = True
+                from regent.conduction.process import RunResult
+                return RunResult(0, b"", False)
+        with self.assertRaises(turnmod.TurnError) as ctx:
+            self._run(SpyRunner(), launch_precondition=lambda: False)
+        self.assertEqual(ctx.exception.code, "DISARMED")
+        self.assertFalse(launched["flag"])  # never spawned
+        # activity suspended (turn lock released), no product committed
+        self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+        self.assertFalse((self.work / "out.txt").exists())
+
     def test_turn_violation_when_agent_escapes_envelope(self):
         self._start_build()
         # fake agent writes DIRECTLY outside the envelope, bypassing the hook

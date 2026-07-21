@@ -102,11 +102,21 @@ def _atomic_write(path: Path, text: str) -> None:
     _fsync_dir(path)
 
 
+_ARM_KEYS = {"arm_id", "plan_id", "activity_epoch", "turn_token", "config"}
+
+
 def _raw_arm(state_dir: Path) -> dict | None:
     try:
-        return json.loads(_arm_path(state_dir).read_text(encoding="utf-8"))
+        data = json.loads(_arm_path(state_dir).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None  # non-dict JSON is not a token
+
+
+def _well_formed(payload: dict) -> bool:
+    """A token missing arm_id/config would later KeyError past the daemon's
+    failure handler — so an ill-formed token is never returned as valid."""
+    return _ARM_KEYS <= set(payload) and isinstance(payload.get("config"), dict)
 
 
 def _validate_arm_config(root: Path, plan_id: str, config: dict) -> dict:
@@ -208,7 +218,8 @@ def read_arm(service: ActivityService) -> dict | None:
     activity = service.store.load().get("activity") or {}
     cur_token = (activity.get("turn") or {}).get("token") if activity.get("state") == \
         "ACTIVE" else (activity.get("suspension") or {}).get("owning_turn")
-    bound = (payload.get("plan_id") == activity.get("id")
+    bound = (_well_formed(payload)  # a malformed token is never treated as valid
+             and payload.get("plan_id") == activity.get("id")
              and payload.get("activity_epoch") == activity.get("epoch")
              and payload.get("turn_token") == cur_token)
     if bound:
@@ -276,6 +287,27 @@ def _confirm_disarmed(service: ActivityService, *, arm_id: str | None) -> bool:
     return False
 
 
+def _confirm_absent_durable(service: ActivityService) -> str:
+    """The IDLE path must not report a clean terminal over a prior unlink whose
+    dir-fsync had failed. Under the lock: if a token is present (a rearm raced
+    in) → "present" (re-evaluate, never delete it); if absent → run the dir-fsync
+    barrier so the absence is DURABLE → "durable", or "failed" if the fsync
+    fails. Retries transient fsync failures."""
+    for _ in range(3):
+        try:
+            with _arm_lock(service.state_dir):
+                if _raw_arm(service.state_dir) is not None:
+                    return "present"
+                try:
+                    _fsync_dir(_arm_path(service.state_dir))
+                except OSError:
+                    continue  # transient; retry
+                return "durable"
+        except MutationMutexBusy:
+            continue
+    return "failed"
+
+
 def run_daemon(service: ActivityService, *, poll: float = 5.0,
                claude_bin: str = "claude", once: bool = False,
                runner=None, on_state=None) -> dict:
@@ -321,6 +353,15 @@ def run_daemon(service: ActivityService, *, poll: float = 5.0,
                 return finish("SIGNALLED")
             armed = read_arm(service)
             if armed is None:
+                # Confirm the absence is DURABLE (a prior unlink may not have
+                # fsynced) before reporting a clean IDLE — without clobbering a
+                # concurrent rearm.
+                status = _confirm_absent_durable(service)
+                if status == "present":
+                    continue  # a rearm appeared; re-evaluate
+                if status == "failed":
+                    emit("DISARM_FAILED")
+                    return _result("DISARM_FAILED", transitions)
                 emit("IDLE")
                 if once:
                     return _result("IDLE", transitions)
