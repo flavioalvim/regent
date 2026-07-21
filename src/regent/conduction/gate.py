@@ -38,33 +38,34 @@ def run_gate(root: Path, *, command: str, declared_in: Path, artifact: Path,
     if runner is None:
         runner = SubprocessRunner()
 
+    # ONE cleanup guard around execution + both publishes (see consult.py).
     try:
         result = runner.run(["bash", "-c", command], cwd=str(root),
                             timeout=timeout)
+        raw = result.output_bytes
+        output_bytes = len(raw)
+        truncated = output_bytes > TAIL_LIMIT
+
+        if result.timed_out:
+            outcome = "TIMEOUT"
+        elif result.exit_code == 0:
+            outcome = "GREEN"
+        else:
+            outcome = "RED"
+
+        if truncated:
+            evidence.write_sibling("full", raw)  # integral RAW BYTES first
+            tail = raw[-TAIL_LIMIT:].decode("utf-8", errors="replace")
+            body = (f"[truncated: full output is {output_bytes} bytes — see "
+                    f"{evidence.siblings['full'].name}; tail follows]\n" + tail)
+        else:
+            body = raw.decode("utf-8", errors="replace")
+        evidence.write_main(header(outcome, result.exit_code, linkage,
+                                   command=command, output_bytes=output_bytes,
+                                   truncated=truncated), body)
     except BaseException:
         evidence.cleanup_orphans()
         raise
-    raw = result.output_bytes
-    output_bytes = len(raw)
-    truncated = output_bytes > TAIL_LIMIT
-
-    if result.timed_out:
-        outcome = "TIMEOUT"
-    elif result.exit_code == 0:
-        outcome = "GREEN"
-    else:
-        outcome = "RED"
-
-    if truncated:
-        evidence.write_sibling("full", raw)  # integral RAW BYTES first
-        tail = raw[-TAIL_LIMIT:].decode("utf-8", errors="replace")
-        body = (f"[truncated: full output is {output_bytes} bytes — see "
-                f"{evidence.siblings['full'].name}; tail follows]\n" + tail)
-    else:
-        body = raw.decode("utf-8", errors="replace")
-    evidence.write_main(header(outcome, result.exit_code, linkage,
-                               command=command, output_bytes=output_bytes,
-                               truncated=truncated), body)
 
     return {"ok": outcome == "GREEN", "outcome": outcome,
             "exit_code": result.exit_code, "artifact": str(evidence.main)}

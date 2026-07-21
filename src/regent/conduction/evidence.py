@@ -67,7 +67,7 @@ class EvidenceSet:
         path = self.siblings[key]
         try:
             atomic_write(path, content)
-        except OSError:
+        except (OSError, EvidenceConflict):
             self.cleanup_orphans()
             raise
         self._written.append(path)
@@ -81,7 +81,7 @@ class EvidenceSet:
         content = "\n".join(lines) + "\n\n" + body
         try:
             atomic_write(self.main, content)
-        except OSError:
+        except (OSError, EvidenceConflict):
             self.cleanup_orphans()
             raise
         return self.main

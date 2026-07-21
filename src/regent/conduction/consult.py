@@ -40,41 +40,47 @@ def run_consult(root: Path, *, prompt_file: Path, artifact: Path, linkage: str,
             raise AdvisorUnavailable(f"'{codex_bin}' not found on PATH")
         runner = SubprocessRunner()
 
-    evidence.write_sibling("prompt", prompt_bytes)  # byte-identical copy first
-
-    fd, msg_file = tempfile.mkstemp(prefix="regent-consult-", suffix=".txt")
-    os.close(fd)
+    # ONE cleanup guard around the WHOLE operation (sibling publish, temp
+    # file, execution and the main publish): any exception — OSError,
+    # EvidenceConflict from a no-clobber race on the main artifact, anything —
+    # removes the already-published siblings. Only a completed write_main
+    # (terminal outcome) leaves the pair behind.
     try:
-        argv = [codex_bin, "--ask-for-approval", "never",
-                "--sandbox", "read-only",  # MANDATORY, not configurable
-                "exec", "--cd", str(root), "-o", msg_file, prompt_text]
-        result = runner.run(argv, cwd=str(root), timeout=timeout)
+        evidence.write_sibling("prompt", prompt_bytes)  # byte-identical copy
+        fd, msg_file = tempfile.mkstemp(prefix="regent-consult-", suffix=".txt")
+        os.close(fd)
         try:
-            last_message = Path(msg_file).read_text(encoding="utf-8",
-                                                    errors="replace")
-        except OSError:
-            last_message = ""
+            argv = [codex_bin, "--ask-for-approval", "never",
+                    "--sandbox", "read-only",  # MANDATORY, not configurable
+                    "exec", "--cd", str(root), "-o", msg_file, prompt_text]
+            result = runner.run(argv, cwd=str(root), timeout=timeout)
+            try:
+                last_message = Path(msg_file).read_text(encoding="utf-8",
+                                                        errors="replace")
+            except OSError:
+                last_message = ""
+        finally:
+            try:
+                os.unlink(msg_file)
+            except OSError:
+                pass
+
+        if result.timed_out:
+            outcome = "TIMEOUT"
+        elif result.exit_code != 0:
+            outcome = "FAILURE"
+        else:
+            outcome = "SUCCESS"
+
+        body = last_message if last_message.strip() else result.output
+        pattern = (expect_verdict if expect_verdict is not None
+                   else DEFAULT_VERDICT_RE)
+        verdict = _extract_verdict(body, pattern)
+        evidence.write_main(header(outcome, result.exit_code, linkage,
+                                   verdict=verdict), body)
     except BaseException:
-        evidence.cleanup_orphans()  # non-terminal: never leave half a pair
+        evidence.cleanup_orphans()
         raise
-    finally:
-        try:
-            os.unlink(msg_file)
-        except OSError:
-            pass
-
-    if result.timed_out:
-        outcome = "TIMEOUT"
-    elif result.exit_code != 0:
-        outcome = "FAILURE"
-    else:
-        outcome = "SUCCESS"
-
-    body = last_message if last_message.strip() else result.output
-    pattern = expect_verdict if expect_verdict is not None else DEFAULT_VERDICT_RE
-    verdict = _extract_verdict(body, pattern)
-    evidence.write_main(header(outcome, result.exit_code, linkage,
-                               verdict=verdict), body)
 
     verdict_ok = verdict is not None if expect_verdict is not None else True
     return {"ok": outcome == "SUCCESS" and verdict_ok, "outcome": outcome,

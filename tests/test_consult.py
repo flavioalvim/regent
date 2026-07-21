@@ -131,6 +131,21 @@ class ConsultTest(unittest.TestCase):
                         artifact=self.artifact, linkage="X",
                         codex_bin="definitely-not-a-real-binary-xyz")
 
+    def test_conflict_race_on_main_cleans_prompt_orphan(self):
+        artifact = self.artifact
+
+        class RacingRunner(FakeRunner):
+            def run(inner, argv, *, cwd, timeout):
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_text("raced-in evidence", encoding="utf-8")
+                return super().run(argv, cwd=cwd, timeout=timeout)
+
+        with self.assertRaises(EvidenceConflict):
+            self._consult(RacingRunner())
+        self.assertFalse(Path(str(artifact) + "-PROMPT.md").exists())  # cleaned
+        self.assertEqual(artifact.read_text(encoding="utf-8"),
+                         "raced-in evidence")  # the racer's evidence untouched
+
     def test_runner_never_inherits_stdin(self):
         from regent.conduction.process import SubprocessRunner
         result = SubprocessRunner().run(
