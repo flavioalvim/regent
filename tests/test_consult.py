@@ -131,6 +131,13 @@ class ConsultTest(unittest.TestCase):
                         artifact=self.artifact, linkage="X",
                         codex_bin="definitely-not-a-real-binary-xyz")
 
+    def test_runner_never_inherits_stdin(self):
+        from regent.conduction.process import SubprocessRunner
+        result = SubprocessRunner().run(
+            ["bash", "-c", "cat; echo done"], cwd=str(self.root), timeout=5)
+        self.assertFalse(result.timed_out)  # cat gets EOF immediately (DEVNULL)
+        self.assertIn("done", result.output)
+
     def test_consult_cli_with_fake_codex_on_path(self):
         bindir = self.root / "bin"
         bindir.mkdir()

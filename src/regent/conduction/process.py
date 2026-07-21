@@ -22,9 +22,12 @@ class RunResult:
 
 class SubprocessRunner:
     def run(self, argv: list[str], *, cwd: str, timeout: float) -> RunResult:
-        proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
-                                start_new_session=True)
+                                start_new_session=True)  # headless: NEVER
+        # inherit the parent's stdin — a child waiting for EOF on an
+        # inherited pipe hangs forever (caught live by the dogfooded review)
         try:
             output, _ = proc.communicate(timeout=timeout)
             return RunResult(proc.returncode, output or "", False)
