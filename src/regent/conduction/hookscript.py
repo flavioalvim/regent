@@ -28,6 +28,8 @@ import sys
 from pathlib import Path
 
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+READ_ONLY_TOOLS = {"Read", "Glob", "Grep", "NotebookRead", "TodoWrite",
+                   "WebFetch", "WebSearch", "Task"}
 
 
 def _canonical(line: dict) -> str:
@@ -106,17 +108,17 @@ def _decide(payload: dict) -> dict:
                                        "permissionDecision": "deny",
                                        "permissionDecisionReason":
                                        "outside the turn envelope"}}
-    # Any other tool that can write or execute (Bash, WebFetch side effects...)
-    # is denied as defense in depth; read-only tools pass.
-    if tool_name in ("Bash", "BashOutput", "KillShell"):
-        _append_event({"kind": "pre", "tool": tool_name, "tool_use_id": tool_use_id,
-                       "paths": [], "decision": "deny"})
-        return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                                       "permissionDecision": "deny",
-                                       "permissionDecisionReason":
-                                       "execution tools are not permitted in a "
-                                       "confined turn"}}
-    return {}  # read-only tools: allow silently
+    # Default-deny: only an ALLOWLIST of known read-only tools passes silently.
+    # Anything else — Bash/exec, an unknown/future tool, a malformed payload —
+    # is denied (a write/exec we do not recognize must never slip through).
+    if tool_name in READ_ONLY_TOOLS:
+        return {}
+    _append_event({"kind": "pre", "tool": tool_name or "<unknown>",
+                   "tool_use_id": tool_use_id, "paths": [], "decision": "deny"})
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "permissionDecision": "deny",
+                                   "permissionDecisionReason":
+                                   "tool not in the confined-turn allowlist"}}
 
 
 def _post(payload: dict) -> dict:

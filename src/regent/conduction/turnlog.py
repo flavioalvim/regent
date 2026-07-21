@@ -116,49 +116,78 @@ def _blob_sha256(root: Path, path: str) -> str | None:
 
 
 def attribute_changes(root: Path, events: list[dict], *, envelope: list[str],
-                      gate_envelope: list[str], exemptions: list[str]) -> dict:
-    """Returns {'attributed': [...], } or raises Violation. Proof: every changed
-    path must be explained by an agent post-event (blob sha matches), a declared
-    gate-effect path, or an operational exemption."""
+                      exemption_files: list[str], gate_effect_paths: list[str],
+                      gate_envelope: list[str]) -> dict:
+    """The load-bearing proof. Returns {'attributed': [...]} or raises Violation.
+
+    Every changed path must be EXACTLY one of:
+    - a specific supervisor-owned exemption file (exact path, never a whole dir);
+    - a gate effect: in the RE-BASELINE delta the caller computed
+      (gate_effect_paths, i.e. it appeared only after the gate ran) AND inside a
+      declared gate_envelope that is a SUBSET of the agent envelope;
+    - an agent write: a matching `pre` allow + `post` for the same tool_use_id,
+      with the worktree blob sha256 equal to the post digest and the real-path
+      inside the envelope. Deletions still require envelope membership.
+    Anything else is a Violation. mode/type changes without a matching post fail."""
     root = Path(root).resolve()
+
+    # (path, tool_use_id) → post digest, only for paths whose `pre` was ALLOWED.
+    allowed_pre = {(e.get("tool_use_id"), _rel(root, p))
+                   for e in events if e.get("kind") == "pre"
+                   and e.get("decision") == "allow" for p in e.get("paths", [])}
     posts: dict[str, str | None] = {}
-    for event in events:
-        if event.get("kind") == "post" and event.get("path"):
-            try:
-                rel = str(Path(event["path"]).resolve().relative_to(root))
-            except (ValueError, OSError):
-                rel = event["path"]
-            posts[rel] = event.get("content_sha256")
+    for e in events:
+        if e.get("kind") == "post" and e.get("path"):
+            rel = _rel(root, e["path"])
+            if (e.get("tool_use_id"), rel) in allowed_pre:
+                posts[rel] = e.get("content_sha256")
+
+    exempt = {_rel(root, p) for p in exemption_files}
+    gate_effects = {_rel(root, p) for p in gate_effect_paths}
 
     def _in(path: str, roots: list[str]) -> bool:
         real = (root / path).resolve()
         for r in roots:
-            rr = (root / r).resolve()
+            rr = Path(r).resolve() if Path(r).is_absolute() else (root / r).resolve()
             if real == rr or rr in real.parents:
                 return True
         return False
 
+    # gate_envelope must be a subset of the agent envelope.
+    for g in gate_envelope:
+        if not _in(_rel(root, g) if not Path(g).is_absolute() else
+                   str(Path(g).resolve()), envelope):
+            raise Violation({"reason": "gate_envelope not subset of envelope",
+                             "path": g})
+
     attributed, violations = [], []
     for status, path in changed_paths(root):
-        if _in(path, exemptions):
-            continue  # operational files: PLAN-002 choreography handles them
+        if path in exempt:
+            continue
         if path in posts:
-            if status.strip() == "D":
-                attributed.append(path)
-                continue
-            actual = _blob_sha256(root, path)
-            if actual != posts[path]:
-                violations.append({"path": path, "reason": "blob sha mismatch",
-                                   "expected": posts[path], "actual": actual})
-            elif not _in(path, envelope):
+            if not _in(path, envelope):
                 violations.append({"path": path, "reason": "posted but outside envelope"})
-            else:
+            elif status.strip() == "D":
                 attributed.append(path)
-        elif _in(path, gate_envelope):
-            attributed.append(path)  # legitimate gate effect
+            else:
+                actual = _blob_sha256(root, path)
+                if actual != posts[path]:
+                    violations.append({"path": path, "reason": "blob sha mismatch",
+                                       "expected": posts[path], "actual": actual})
+                else:
+                    attributed.append(path)
+        elif path in gate_effects and _in(path, gate_envelope):
+            attributed.append(path)  # a genuine gate effect, in scope
         else:
-            violations.append({"path": path, "reason": "changed with no post event "
-                               "and not a declared gate effect"})
+            violations.append({"path": path, "reason": "changed with no allowed "
+                               "post event and not a scoped gate effect"})
     if violations:
         raise Violation({"violations": violations})
     return {"attributed": attributed}
+
+
+def _rel(root: Path, path: str) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(root))
+    except (ValueError, OSError):
+        return path

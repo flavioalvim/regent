@@ -169,12 +169,36 @@ class TurnTest(unittest.TestCase):
             ["git", "-C", str(self.root), "ls-files", "work/out.txt"],
             capture_output=True, text=True).stdout.strip(), "")  # not committed
 
-    def test_step_already_done_refused(self):
+    def test_done_step_is_not_current(self):
+        # A step with its STEP-NN.md present is no longer the current step;
+        # asking to run it is refused (current-step computation).
         self._start_build()
         (self.artdir / "STEP-09.md").write_text("done", encoding="utf-8")
         with self.assertRaises(turnmod.TurnError) as ctx:
             self._run(_fake_claude_runner([]))
-        self.assertEqual(ctx.exception.code, "STEP_ALREADY_DONE")
+        self.assertEqual(ctx.exception.code, "STEP_MISMATCH")
+
+    def test_gate_must_be_the_declared_step_gate(self):
+        self._start_build()
+        with self.assertRaises(turnmod.TurnError) as ctx:
+            turnmod.run_turn(
+                self.root, prompt_file=self.prompt, envelope=[str(self.work)],
+                gate_command="echo something-else", declared_in=self.plan,
+                step="PLAN-004/STEP-09", artifact_dir=self.artdir,
+                linkage="x", runner=_fake_claude_runner([]), service=self.service)
+        self.assertEqual(ctx.exception.code, "PROVENANCE")
+
+    def test_nonzero_agent_exit_is_failure(self):
+        self._start_build()
+        class ExitOneRunner:
+            def run(self, argv, *, cwd, timeout, env=None):
+                if argv and argv[0] == "bash":
+                    from regent.conduction.process import SubprocessRunner
+                    return SubprocessRunner().run(argv, cwd=cwd, timeout=timeout, env=env)
+                return RunResult(1, b"agent failed", False)  # non-zero exit
+        result = self._run(ExitOneRunner())
+        self.assertEqual(result["outcome"], "FAILURE")
+        self.assertFalse((self.artdir / "STEP-09.md").exists())
 
 
 if __name__ == "__main__":

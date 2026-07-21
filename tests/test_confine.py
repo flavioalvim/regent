@@ -95,6 +95,9 @@ class AttributionTest(unittest.TestCase):
         os.environ["REGENT_EVENT_LOG"] = str(self.log)
         os.environ["REGENT_TURN_SECRET"] = "cd" * 16
         try:
+            _append_event({"kind": "pre", "tool": "Write",
+                           "tool_use_id": tool_use_id, "paths": [str(path)],
+                           "decision": "allow"})
             _append_event({"kind": "post", "tool": "Write",
                            "tool_use_id": tool_use_id, "path": str(path),
                            "content_sha256": hashlib.sha256(
@@ -103,9 +106,14 @@ class AttributionTest(unittest.TestCase):
             for key in ("REGENT_EVENT_LOG", "REGENT_TURN_SECRET"):
                 os.environ.pop(key, None)
 
-    def _attribute(self, **kwargs):
+    def _attribute(self, *, envelope, gate_envelope=None, exemptions=None,
+                   gate_effects=None):
         events = read_events(self.log)
-        return attribute_changes(self.root, events, **kwargs)
+        return attribute_changes(
+            self.root, events, envelope=[str(self.root / e) for e in envelope],
+            exemption_files=exemptions or [],
+            gate_effect_paths=[str(self.root / g) for g in (gate_effects or [])],
+            gate_envelope=[str(self.root / g) for g in (gate_envelope or [])])
 
     def test_diff_equals_attributed_set_ok(self):
         self._write_and_post("work/a.txt", "hello")
@@ -116,7 +124,7 @@ class AttributionTest(unittest.TestCase):
         (self.work / "sneaky.txt").write_text("no post event", encoding="utf-8")
         with self.assertRaises(Violation) as ctx:
             self._attribute(envelope=["work"], gate_envelope=[], exemptions=[])
-        self.assertIn("no post event", str(ctx.exception.detail))
+        self.assertIn("no allowed post event", str(ctx.exception.detail))
 
     def test_blob_sha_mismatch_is_violation(self):
         self._write_and_post("work/a.txt", "declared")
@@ -130,17 +138,49 @@ class AttributionTest(unittest.TestCase):
         with self.assertRaises(Violation):
             self._attribute(envelope=["work"], gate_envelope=[], exemptions=[])
 
-    def test_gate_touching_inside_gate_envelope_ok(self):
-        (self.root / "dist").mkdir()
-        (self.root / "dist" / "built.whl").write_text("artifact", encoding="utf-8")
-        result = self._attribute(envelope=["work"], gate_envelope=["dist"],
-                                  exemptions=[])
-        self.assertIn("dist/built.whl", result["attributed"])
+    def test_gate_effect_inside_scope_ok(self):
+        # gate_envelope must be a subset of envelope: put dist under work.
+        (self.work / "dist").mkdir()
+        (self.work / "dist" / "built.whl").write_text("artifact", encoding="utf-8")
+        result = self._attribute(envelope=["work"], gate_envelope=["work/dist"],
+                                  gate_effects=["work/dist/built.whl"])
+        self.assertIn("work/dist/built.whl", result["attributed"])
 
-    def test_gate_touching_outside_envelope_violation(self):
-        (self.root / "random.txt").write_text("stray gate effect", encoding="utf-8")
+    def test_gate_effect_not_in_rebaseline_is_violation(self):
+        # A change that was NOT part of the gate re-baseline delta cannot be
+        # laundered as a gate effect even if it sits in gate_envelope.
+        (self.work / "dist").mkdir()
+        (self.work / "dist" / "sneaky").write_text("pre-existing", encoding="utf-8")
         with self.assertRaises(Violation):
-            self._attribute(envelope=["work"], gate_envelope=["dist"], exemptions=[])
+            self._attribute(envelope=["work"], gate_envelope=["work/dist"],
+                            gate_effects=[])  # empty delta → not a gate effect
+
+    def test_gate_envelope_not_subset_of_envelope_violation(self):
+        (self.root / "outside").mkdir()
+        (self.root / "outside" / "x").write_text("y", encoding="utf-8")
+        with self.assertRaises(Violation):
+            self._attribute(envelope=["work"], gate_envelope=["outside"],
+                            gate_effects=["outside/x"])
+
+    def test_post_without_allowed_pre_is_violation(self):
+        # A post event whose pre was DENIED must not attribute the change.
+        import os
+        (self.work / "denied.txt").write_text("written anyway", encoding="utf-8")
+        os.environ["REGENT_EVENT_LOG"] = str(self.log)
+        os.environ["REGENT_TURN_SECRET"] = "cd" * 16
+        try:
+            _append_event({"kind": "pre", "tool": "Write", "tool_use_id": "d1",
+                           "paths": [str(self.work / "denied.txt")],
+                           "decision": "deny"})
+            _append_event({"kind": "post", "tool": "Write", "tool_use_id": "d1",
+                           "path": str(self.work / "denied.txt"),
+                           "content_sha256": __import__("hashlib").sha256(
+                               b"written anyway").hexdigest()})
+        finally:
+            for k in ("REGENT_EVENT_LOG", "REGENT_TURN_SECRET"):
+                os.environ.pop(k, None)
+        with self.assertRaises(Violation):
+            self._attribute(envelope=["work"])
 
     def test_operational_exemptions_pass(self):
         control = self.root / ".regent" / "control.json"
