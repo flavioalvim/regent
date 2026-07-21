@@ -67,7 +67,15 @@ executable gate) → advisor review (+1 rebuttal cycle) → `APPROVAL.md`
 (`status: APPROVED|REJECTED|CANCELLED` + actor) → `regent activity conclude --status
 <approval status>` + operational commit.
 
-**Build** (REQ-005 protocol, unchanged in content): baseline → per step: clean worktree
+**Build** — two ways to execute a step. **Confined (preferred when the step is bounded to
+files):** `regent turn run --prompt-file <task> --envelope <path> [--envelope ...]
+--gate-command "<step gate>" --declared-in <PLAN.md> --step PLAN-NNN/STEP-NN
+--artifact-dir <build dir under .regent> --linkage PLAN-NNN/STEP-NN` — launches a confined
+`claude -p` that may only write inside the envelope (hook denies the rest), then the
+supervisor verifies (git-proven attribution), runs the gate, and commits with
+`Regent-Step`/`Regent-Turn` trailers. The agent never commits; a violation/tamper/red gate
+never produces a product commit. **Manual (this session, for exploratory steps):** baseline
+→ per step: clean worktree
 (the exempted operational files `control.json`/`audit.jsonl` may be dirty — they are
 staged into the commit that closes the current boundary; record `control.version` from
 `regent status` at step start, and BEFORE staging them run `regent control explain --since-version <o valor registrado>`:

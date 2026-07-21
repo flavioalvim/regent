@@ -52,6 +52,14 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     root = Path(root).resolve()
     service = service or ActivityService(root)
     gate_envelope = gate_envelope or []
+    # Resolve paths against the repo root so a relative --artifact-dir/--envelope
+    # (as the CLI passes) works (caught by the e2e, not the abs-path unit tests).
+    artifact_dir = (root / artifact_dir).resolve() if not Path(artifact_dir).is_absolute() \
+        else Path(artifact_dir).resolve()
+    envelope = [str((root / p).resolve()) if not Path(p).is_absolute()
+                else str(Path(p).resolve()) for p in envelope]
+    gate_envelope = [str((root / p).resolve()) if not Path(p).is_absolute()
+                     else str(Path(p).resolve()) for p in gate_envelope]
 
     # -- preconditions (REQ-005 binding) ----------------------------------
     control = service.store.load()
