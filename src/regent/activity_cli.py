@@ -37,12 +37,12 @@ _EXIT_BY_CODE = {
 }
 
 # Daemon terminal states → exit code. OK states exit 0; owner-initiated stops
-# exit 2; failure conditions exit 3 (reuse the loop codes where they exist).
+# (stop-request, disarm, signal) exit 2; failure/misconfiguration exit 3.
 _DAEMON_EXIT = {
-    "STEPS_COMPLETE": 0, "IDLE": 0, "SIGNALLED": 0,
-    "STOPPED": 2, "DISARMED": 2, "PLAN_NOT_EXECUTABLE": 2, "LOOP_MISCONFIGURED": 2,
+    "STEPS_COMPLETE": 0, "IDLE": 0,
+    "STOPPED": 2, "DISARMED": 2, "SIGNALLED": 2, "PLAN_NOT_EXECUTABLE": 2,
     "HALTED": 3, "ABORTED": 3, "MAX_TURNS": 3, "LOOP_CONFLICT": 3, "LOOP_DIRTY": 3,
-    "LOOP_BUSY": 3, "USAGE": 64,
+    "LOOP_BUSY": 3, "LOOP_MISCONFIGURED": 3, "FAILED": 3, "USAGE": 64,
 }
 
 
@@ -336,9 +336,16 @@ def run(args, out=None) -> int:
                 return _emit({"ok": True, **payload}, 0, out)
             if args.command == "disarm":
                 return _emit(sup.disarm(service, arm_id=args.arm_id), 0, out)
-            # daemon run
+            # daemon run — stream one JSON line per transition, then the final
+            # result object as the LAST line (parse the last line for the summary).
+            sink = out or sys.stdout
+
+            def _on_state(state, extra):
+                print(json.dumps({"transition": state, **extra}, sort_keys=True),
+                      file=sink)
             result = sup.run_daemon(service, poll=args.poll,
-                                    claude_bin=args.claude_bin, once=args.once)
+                                    claude_bin=args.claude_bin, once=args.once,
+                                    on_state=_on_state)
             code = _DAEMON_EXIT.get(result["final_state"], 3)
             return _emit(result, code, out)
         return _fail("USAGE", f"unknown command {args.command!r}", out)

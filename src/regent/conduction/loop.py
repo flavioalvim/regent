@@ -124,9 +124,6 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
             if len(turns) >= max_turns:
                 condition = "MAX_TURNS"
                 break
-            if guard is not None and not guard():  # revalidate arm before each turn
-                condition = "DISARMED"
-                break
             step = remaining[0]
             gate = _step_gate(plan_text, step)
             attempt = _attempt_number(artifact_dir, step)
@@ -136,6 +133,16 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
             # worktree that run_turn requires clean.
             prompt_file = service.state_dir / f"prompt-{step}-try{attempt}.txt"
             prompt_file.write_text(prompt, encoding="utf-8")
+            # Revalidate the arm as LATE as possible — immediately before launch
+            # — to shrink the guard→launch window (a disarm concluded here is
+            # still observed; an in-flight turn is the abort path's job).
+            if guard is not None and not guard():
+                condition = "DISARMED"
+                try:
+                    prompt_file.unlink()
+                except OSError:
+                    pass
+                break
             try:
                 result = run_turn(
                     root, prompt_file=prompt_file, envelope=envelope,

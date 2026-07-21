@@ -121,6 +121,50 @@ class SupervisorTest(unittest.TestCase):
     def test_disarm_idempotent(self):
         self.assertFalse(sup.disarm(self.service)["disarmed"])  # nothing armed
 
+    def test_read_arm_discard_keeps_rearmed_token(self):
+        # A stale token snapshot must not delete a token that was rearmed in the
+        # window (the discard is CAS-by-arm_id under the lock).
+        stale = sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        # simulate: the caller holds `stale`, but disk now has a fresh rearm B
+        sup.disarm(self.service, arm_id=stale["arm_id"])
+        fresh = sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        # invalidate the binding so read_arm would try to discard the *stale* one
+        def fn(body):
+            body["activity"]["turn"]["token"] = "ee" * 16
+            return body
+        self.service.store.mutate(fn)
+        # read_arm sees a non-bound token; it discards it, but only because the
+        # on-disk arm_id matches what it read — B is the current one, so B goes.
+        self.assertIsNone(sup.read_arm(self.service))
+        self.assertIsNone(sup._raw_arm(self.service.state_dir))  # removed durably
+
+    # -- arm config validation (advisor finding #4) -----------------------
+
+    def test_arm_rejects_missing_template(self):
+        cfg = self._config()
+        cfg["prompt_template"] = str(self.root / "nope.txt")
+        with self.assertRaises(sup.SupervisorError) as ctx:
+            sup.arm(self.service, plan_id="PLAN-006", config=cfg)
+        self.assertEqual(ctx.exception.code, "NOT_EXECUTABLE")
+
+    def test_arm_rejects_declared_in_outside_plan_dir(self):
+        stray = self.root / "STRAY.md"
+        stray.write_text("### STEP-01\n- **Gate:** `true`\n", encoding="utf-8")
+        cfg = self._config()
+        cfg["declared_in"] = str(stray)
+        with self.assertRaises(sup.SupervisorError) as ctx:
+            sup.arm(self.service, plan_id="PLAN-006", config=cfg)
+        self.assertEqual(ctx.exception.code, "NOT_EXECUTABLE")
+
+    def test_arm_rejects_plan_without_steps(self):
+        empty = self.plandir / "EMPTY.md"
+        empty.write_text("# no steps\n", encoding="utf-8")
+        cfg = self._config()
+        cfg["declared_in"] = str(empty)
+        with self.assertRaises(sup.SupervisorError) as ctx:
+            sup.arm(self.service, plan_id="PLAN-006", config=cfg)
+        self.assertEqual(ctx.exception.code, "NOT_EXECUTABLE")
+
     def test_arm_token_stale_after_takeover_ignored(self):
         sup.arm(self.service, plan_id="PLAN-006", config=self._config())
         # rotate the token (as a takeover would) without changing the epoch
@@ -225,6 +269,35 @@ class SupervisorTest(unittest.TestCase):
         sup.arm(self.service, plan_id="PLAN-006", config=self._config())
         r = sup.run_daemon(self.service, once=False, runner=self._disarming_runner())
         self.assertEqual(r["final_state"], "DISARMED")
+
+    def test_daemon_refuses_to_start_when_conclusion_present(self):
+        # advisor finding #2: a mediated CONCLUSION.md (committed cleanly after
+        # arm — e.g. a crash between writing it and `activity conclude`) must
+        # stop the daemon from STARTING any turn; the guard checks it each turn.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        (self.artdir / "CONCLUSION.md").write_text("mediated\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "conc"], check=True)
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "DISARMED")
+        self.assertIsNone(sup.read_arm(self.service))
+        # no turn ran → no work files
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root), "ls-files", "work/"],
+            capture_output=True, text=True).stdout.strip(), "")
+
+    def test_daemon_disarms_on_unexpected_failure(self):
+        # advisor finding #4: a non-LoopError escaping run_loop must still disarm.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        import regent.conduction.supervisor as mod
+        orig = mod.run_loop
+        mod.run_loop = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        finally:
+            mod.run_loop = orig
+        self.assertEqual(r["final_state"], "FAILED")
+        self.assertIsNone(sup.read_arm(self.service))
 
 
 if __name__ == "__main__":

@@ -17,7 +17,10 @@ def _run(argv):
     with redirect_stdout(out):
         code = main(argv)
     text = out.getvalue().strip()
-    return code, json.loads(text) if text else None
+    # daemon streams one JSON line per transition, then the final object last;
+    # every other command emits a single line. Parse the LAST non-empty line.
+    last = text.splitlines()[-1] if text else ""
+    return code, json.loads(last) if last else None
 
 
 # A real fake-claude: parses the prompt for the STEP, then writes
@@ -121,6 +124,16 @@ class SupervisorCliTest(unittest.TestCase):
         code, payload = _run(["daemon", "--project", str(self.root), "run", "--once"])
         self.assertEqual(code, 2)
         self.assertEqual(payload["final_state"], "STOPPED")
+
+    def test_daemon_cli_streams_transitions(self):
+        # per-transition JSON lines, then the final object last (advisor finding #5)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main(["daemon", "--project", str(self.root), "run", "--once"])
+        lines = [json.loads(ln) for ln in out.getvalue().splitlines() if ln.strip()]
+        self.assertGreaterEqual(len(lines), 2)  # a transition line + final object
+        self.assertEqual(lines[0].get("transition"), "IDLE")
+        self.assertEqual(lines[-1]["final_state"], "IDLE")
 
     def test_e2e_arm_daemon_drives_two_steps_to_complete(self):
         # STEP-04 e2e: a REAL fake-claude, driven through the CLI end to end.
