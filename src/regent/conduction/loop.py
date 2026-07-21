@@ -12,7 +12,7 @@ from pathlib import Path
 
 from ..activity import ActivityService
 from ..protocol.control import _FlockMutex, MutationMutexBusy
-from .evidence import EvidenceSet, header
+from .evidence import EvidenceSet, EvidenceConflict as _EvidenceConflict, header
 from .turn import TurnError, run_turn, _git, _slug
 
 # Outcome → loop stop condition (the complete map, PLAN-005 v3 §6).
@@ -91,6 +91,8 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
     service = service or ActivityService(root)
     artifact_dir = (root / artifact_dir).resolve() if not Path(artifact_dir).is_absolute() \
         else Path(artifact_dir).resolve()
+    if max_turns < 1:
+        raise LoopError("USAGE", {"reason": "--max-turns must be >= 1"})
     template = Path(prompt_template).read_text(encoding="utf-8")
 
     loop_lock = _FlockMutex(service.state_dir / "loop.lock", timeout=0.5)
@@ -142,6 +144,16 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
                 turns.append({"step": step, "attempt": attempt, "outcome": exc.code,
                               "commit": None})
                 break
+            except _EvidenceConflict:
+                condition = "LOOP_CONFLICT"
+                turns.append({"step": step, "attempt": attempt,
+                              "outcome": "EVIDENCE_CONFLICT", "commit": None})
+                break
+            except (subprocess.CalledProcessError, OSError) as exc:
+                condition = "LOOP_CONFLICT"
+                turns.append({"step": step, "attempt": attempt,
+                              "outcome": f"ERROR:{type(exc).__name__}", "commit": None})
+                break
             finally:
                 try:
                     prompt_file.unlink()
@@ -163,10 +175,10 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
                 break
             condition = "LOOP_CONFLICT"
             break
+        _write_loop_evidence(root, artifact_dir, service, condition, turns)
     finally:
         loop_lock.__exit__(None, None, None)
 
-    _write_loop_evidence(root, artifact_dir, service, condition, turns)
     ok = condition == "COMPLETE"
     return {"ok": ok, "stop_condition": condition, "turns": turns, "count": len(turns)}
 
@@ -192,18 +204,44 @@ def _write_loop_evidence(root: Path, artifact_dir: Path, service: ActivityServic
     body = "\n".join(
         f"- {t['step']} try{t['attempt']} → {t['outcome']}"
         + (f" ({t['commit'][:8]})" if t.get("commit") else "") for t in turns)
-    evidence.write_main(header(condition, None, "loop", turns=len(turns)), body or "(no turns)")
-    # Operational commit of the summary: fenced if a token exists (ACTIVE),
-    # otherwise a plain CAS commit (SUSPENDED).
+    evidence.write_main(header(condition, None, "loop", turns=len(turns)),
+                        body or "(no turns)")
+    # Summary commit through a PRIVATE index + HEAD CAS (never the shared index;
+    # no accidentally-staged files). Fenced when a token exists (ACTIVE); a plain
+    # CAS commit when SUSPENDED (no token) — both under the loop lock still held.
+    import os as _os
+    import tempfile as _tf
+    from ..protocol.control import assert_turn_token, NotLockOwner
     control = service.store.load()
     activity = control.get("activity")
+    token = (activity.get("turn") or {}).get("token") if activity else None
     rel = str(artifact.relative_to(root))
     base_sha = _git(root, "rev-parse", "HEAD").strip()
-    _git(root, "add", "--", rel)
-    if not _git(root, "diff", "--cached", "--name-only").strip():
-        return
-    if _git(root, "rev-parse", "HEAD").strip() != base_sha:
-        return  # HEAD moved (raced with resume); leave summary uncommitted
-    _git(root, "commit", "-q", "-m",
-         f"loop(PLAN-005): {condition} summary ({len(turns)} turns)\n\n"
-         f"Regent-Loop: {condition}")
+    index = Path(_tf.mktemp(prefix="regent-loop-index-"))
+    env = dict(_os.environ, GIT_INDEX_FILE=str(index))
+    try:
+        _git(root, "read-tree", "HEAD", env=env)
+        _git(root, "add", "--", rel, env=env)
+        base_tree = _git(root, "rev-parse", "HEAD^{tree}").strip()
+        tree = _git(root, "write-tree", env=env).strip()
+        if tree == base_tree:
+            return
+        if token is not None:
+            try:
+                assert_turn_token(service.store.load(), token)
+            except NotLockOwner:
+                return  # taken over; leave summary uncommitted
+        msg = (f"loop(PLAN-005): {condition} summary ({len(turns)} turns)\n\n"
+               f"Regent-Loop: {condition}")
+        commit = _git(root, "commit-tree", tree, "-p", base_sha, "-m", msg,
+                      env=env).strip()
+        if _git(root, "rev-parse", "HEAD").strip() != base_sha:
+            return  # HEAD moved (raced with resume)
+        _git(root, "update-ref", "-m", "regent loop summary", "HEAD", commit, base_sha,
+             env=env)
+        _git(root, "reset", "--mixed", "HEAD")
+    finally:
+        try:
+            index.unlink()
+        except OSError:
+            pass

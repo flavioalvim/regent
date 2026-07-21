@@ -142,6 +142,11 @@ class LoopTest(unittest.TestCase):
         finally:
             held.__exit__(None, None, None)
 
+    def test_loop_max_turns_zero_is_usage(self):
+        with self.assertRaises(loopmod.LoopError) as ctx:
+            self._loop(_fake_agent_runner({}), max_turns=0)
+        self.assertEqual(ctx.exception.code, "USAGE")
+
     def test_loop_completes_evidence_committed(self):
         self._loop(_fake_agent_runner({}))
         loops = list(self.artdir.glob("LOOP-*.md"))

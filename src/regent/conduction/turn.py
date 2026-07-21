@@ -117,6 +117,21 @@ def recover_turn(root: Path, *, linkage: str, step: str,
         return {"state": "COMMITTED", "commit": log.splitlines()[0]}
     if step_file.exists():
         return {"state": "STEP_DONE", "step_file": str(step_file)}
+    # An abort claimed but not reconciled (crash between claim and suspend):
+    # complete the suspension idempotently and clear the marker.
+    from . import abort as _abort
+    if _abort.pending_claimed(service.state_dir):
+        control = service.store.load()
+        activity = control.get("activity")
+        if activity is not None and activity["state"] == "ACTIVE":
+            token = activity["turn"]["token"]
+            try:
+                service._suspend_locked(checkpoint="turn:ABORT_RECOVERY",
+                                        reason="abort reconciled on recovery")
+            except Exception:  # noqa: BLE001
+                pass
+        _abort.clear_claimed(service.state_dir)
+        return {"state": "ABORT_RECONCILED", "action": "activity suspended; /regent resumes"}
     if _dirty_non_exempt(root):
         return {"state": "PARTIAL", "action": "mediator must inspect/discard the "
                 "worktree; a mid-agent turn is never auto-resumed"}
@@ -280,9 +295,11 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     _abort.clear_turn_nonce(service.state_dir)
     turn.cleanup()
 
-    # ABORTED suspends and never commits product/operational summary here.
+    # ABORTED suspends (app layer releases the lock), then reconciles the
+    # claimed abort marker — idempotent recovery point.
     if outcome == "ABORTED":
         _stopped_suspend(service, token, "LAUNCHED", reason="abort requested")
+        _abort.clear_claimed(service.state_dir)
         return {"ok": False, "outcome": "ABORTED", "files_committed": [],
                 "artifact": str(artifact), "commit": None, "detail": detail}
 

@@ -74,8 +74,8 @@ class AbortRequestTest(unittest.TestCase):
             self._write()
 
     def test_abort_stale_binding_discarded(self):
-        self._write(activity_epoch=99)  # wrong epoch
         abortmod.write_turn_nonce(self.state, "nonce")
+        self._write(activity_epoch=99)  # wrong epoch
         claimed = abortmod.claim_matching_abort(
             self.state, self.audit, activity_id="PLAN-005", activity_epoch=4,
             turn_token="ab" * 16)
@@ -84,15 +84,26 @@ class AbortRequestTest(unittest.TestCase):
         self.assertIn("abort_request_discarded", events)
 
     def test_abort_no_turn_in_flight_discarded(self):
-        self._write()  # no turn nonce written
+        self._write()  # no turn nonce written (turn_nonce=None)
         claimed = abortmod.claim_matching_abort(
             self.state, self.audit, activity_id="PLAN-005", activity_epoch=4,
             turn_token="ab" * 16)
         self.assertIsNone(claimed)
 
+    def test_abort_bound_to_specific_turn_nonce(self):
+        # An abort captured against turn A's nonce is NOT honored for turn B.
+        abortmod.write_turn_nonce(self.state, "nonceA")
+        self._write()  # binds turn_nonce=nonceA
+        abortmod.clear_turn_nonce(self.state)
+        abortmod.write_turn_nonce(self.state, "nonceB")  # a new turn
+        claimed = abortmod.claim_matching_abort(
+            self.state, self.audit, activity_id="PLAN-005", activity_epoch=4,
+            turn_token="ab" * 16)
+        self.assertIsNone(claimed)  # A's abort never kills B
+
     def test_abort_claimed_once(self):
+        abortmod.write_turn_nonce(self.state, "nonce")  # turn in flight FIRST
         self._write()
-        abortmod.write_turn_nonce(self.state, "nonce")
         first = abortmod.claim_matching_abort(
             self.state, self.audit, activity_id="PLAN-005", activity_epoch=4,
             turn_token="ab" * 16)

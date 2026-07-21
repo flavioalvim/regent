@@ -33,6 +33,7 @@ def write_abort_request(state_dir: Path, *, activity_id: str, activity_epoch: in
     state_dir.mkdir(parents=True, exist_ok=True)
     payload = {"id": uuid.uuid4().hex, "activity_id": activity_id,
                "activity_epoch": activity_epoch, "turn_token": turn_token,
+               "turn_nonce": _turn_in_flight(state_dir),  # bind to the CURRENT turn
                "reason": reason, "requested_at": utcnow()}
     path = request_path(state_dir)
     try:
@@ -76,21 +77,34 @@ def claim_matching_abort(state_dir: Path, audit: AuditLog, *, activity_id: str,
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    in_flight = _turn_in_flight(state_dir)
     bound = (payload.get("activity_id") == activity_id
              and payload.get("activity_epoch") == activity_epoch
-             and payload.get("turn_token") == turn_token)
+             and payload.get("turn_token") == turn_token
+             and payload.get("turn_nonce") is not None
+             and payload.get("turn_nonce") == in_flight)  # SAME turn, not just any
     if not bound:
-        _discard(path, audit, payload, "binding mismatch")
+        _discard(path, audit, payload, "binding mismatch or wrong/absent turn nonce")
         return None
-    if _turn_in_flight(state_dir) is None:
-        _discard(path, audit, payload, "no turn in flight")
-        return None
-    claimed = path.with_suffix(".claimed")
+    claimed = path.with_name(f"abort.claimed-{payload['id']}")  # unique, never clobbered
     try:
         os.replace(path, claimed)  # single claim
     except OSError:
         return None
     return payload
+
+
+def pending_claimed(state_dir: Path) -> list[Path]:
+    """Unfinished aborts (claimed but not yet reconciled) — for recovery."""
+    return sorted(Path(state_dir).glob("abort.claimed-*"))
+
+
+def clear_claimed(state_dir: Path) -> None:
+    for p in pending_claimed(state_dir):
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
 
 def _discard(path: Path, audit: AuditLog, payload: dict, reason: str) -> None:
