@@ -72,17 +72,25 @@ executable gate) → advisor review (+1 rebuttal cycle) → `APPROVAL.md`
 staged into the commit that closes the current boundary; record `control.version` from
 `regent status` at step start, and BEFORE staging them run `regent control explain --since-version <o valor registrado>`:
 exit 0 = explained operational churn, `UNATTRIBUTABLE` = the step commit MUST fail) →
-implement → run the gate for real →
+implement → run the gate MECHANIZED:
+`regent gate run --command "<gate from the plan>" --declared-in <PLAN.md path>
+--artifact build/GATE-NN[-tryM].md --linkage PLAN-NNN/STEP-NN` (the command must appear
+verbatim in the plan — `PROVENANCE` otherwise; `GATE_RED`/`TIMEOUT` never proceed and
+never commit; a retry uses a NEW artifact name) →
 `build/STEP-NN.md` → deliberate commit with trailer `Regent-Step: PLAN-NNN/STEP-NN` →
 final advisor review over `BASE-SHA..HEAD` → `build/CONCLUSION.md` (status + actor) →
 `regent activity conclude --status <conclusion status>`.
 
-## 4. Advisor consultations (shared contract — REQ-003 §5)
+## 4. Advisor consultations (shared contract — REQ-003 §5, mechanized)
 
-`codex --ask-for-approval never --sandbox read-only exec --cd <repo> -o <tmpfile>
-"<prompt>"` — full prompt persisted in `<ARTIFACT>-PROMPT.md`; response artifact opens
-with the structured header (`outcome`, `exit_code`, `timestamp`, `linkage`). Fail-closed:
-non-SUCCESS never advances; retry = a NEW recorded consultation.
+Write the full prompt to a file, then:
+`regent advisor consult --prompt-file <path> --artifact <ARTIFACT>.md --linkage
+<ROUND-NNN|PLAN-NNN[/STEP-NN]> [--expect-verdict "<regex>"]`
+The command persists the whole evidence pair (structured header + byte-identical prompt
+copy) on EVERY outcome, enforces the read-only sandbox, and is fail-closed: exit ≠0
+(`ADVISOR_FAILED`, `ADVISOR_UNAVAILABLE`) never advances the activity; retry = a NEW
+consultation with a NEW artifact name (evidence is never overwritten — `CONFLICT`).
+Never invoke the codex CLI directly.
 
 ## 5. Error codes you will see (exact)
 

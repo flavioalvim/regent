@@ -15,7 +15,7 @@ KNOWN_SUBCOMMANDS = {
     "regent activity start", "regent activity resume", "regent activity suspend",
     "regent activity conclude", "regent activity heartbeat",
     "regent activity takeover", "regent stop request", "regent stop check",
-    "regent control explain",
+    "regent control explain", "regent advisor consult", "regent gate run",
 }
 
 
@@ -30,13 +30,18 @@ class SkillAntiDriftTest(unittest.TestCase):
         # Only COMMAND citations count: `regent ...` inside backtick spans.
         for name, text in _templates().items():
             for span in re.findall(r"`([^`]*)`", text.replace("\n", " ")):
-                match = re.match(r"regent (?:(activity|stop|control) )?([a-z-]+)", span)
+                match = re.match(r"regent (?:(activity|stop|control|advisor|gate) )?([a-z-]+)", span)
                 if not match:
                     continue
                 group, word = match.group(1), match.group(2)
                 command = f"regent {group + ' ' if group else ''}{word}"
                 self.assertIn(command, KNOWN_SUBCOMMANDS,
                               f"{name}: unknown command cited: {command!r}")
+
+    def test_skill_no_longer_prescribes_raw_codex(self):
+        for name, text in _templates().items():
+            self.assertNotIn("codex --ask-for-approval", text,
+                             f"{name}: raw codex invocation still prescribed")
 
     def test_skill_templates_error_codes_exist(self):
         allowed = set(_EXIT_BY_CODE) | set(WORKSPACE_VERDICTS) | {
