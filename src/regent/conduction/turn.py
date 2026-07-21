@@ -134,8 +134,13 @@ def recover_turn(root: Path, *, linkage: str, step: str,
         bound = (marker.get("activity_id") == activity.get("id")
                  and marker.get("activity_epoch") == activity.get("epoch"))
         if activity.get("state") == "SUSPENDED":
-            _abort.clear_claimed(service.state_dir)
-            return {"state": "ABORT_RECONCILED", "action": "already suspended; /regent resumes"}
+            if bound and service.lock.status()["state"] == "free":
+                _abort.clear_claimed(service.state_dir)
+                return {"state": "ABORT_RECONCILED",
+                        "action": "already suspended; /regent resumes"}
+            # suspended but lock still held, or marker not bound: do NOT clear
+            return {"state": "ABORT_RECOVERY_INCOMPLETE" if bound
+                    else "ABORT_MARKER_UNBOUND", "action": "mediator must reconcile"}
         if activity.get("state") == "ACTIVE" and bound:
             try:
                 service._suspend_locked(checkpoint="turn:ABORT_RECOVERY",

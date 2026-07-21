@@ -147,6 +147,20 @@ class LoopTest(unittest.TestCase):
             self._loop(_fake_agent_runner({}), max_turns=0)
         self.assertEqual(ctx.exception.code, "USAGE")
 
+    def test_loop_summary_git_failure_is_conflict(self):
+        # A git failure while committing the summary downgrades to LOOP_CONFLICT
+        # regardless of the prior condition.
+        import regent.conduction.loop as lm
+        orig = lm._write_loop_evidence
+        def boom(*a, **k):
+            raise subprocess.CalledProcessError(1, ["git"])
+        lm._write_loop_evidence = boom
+        try:
+            result = self._loop(_fake_agent_runner({"STEP-01": "noop"}))  # HALTED then boom
+        finally:
+            lm._write_loop_evidence = orig
+        self.assertEqual(result["stop_condition"], "LOOP_CONFLICT")
+
     def test_loop_completes_evidence_committed(self):
         self._loop(_fake_agent_runner({}))
         loops = list(self.artdir.glob("LOOP-*.md"))

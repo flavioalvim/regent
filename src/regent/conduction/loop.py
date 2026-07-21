@@ -191,8 +191,7 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
         if summary_conflict and condition == "COMPLETE":
             condition = "LOOP_CONFLICT"  # a mandatory summary could not commit
       except subprocess.CalledProcessError:
-        if condition == "COMPLETE":
-            condition = "LOOP_CONFLICT"
+        condition = "LOOP_CONFLICT"  # any git error in the summary is a conflict
     finally:
         loop_lock.__exit__(None, None, None)
 

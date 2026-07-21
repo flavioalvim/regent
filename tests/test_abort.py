@@ -173,6 +173,32 @@ class TurnAbortIntegrationTest(unittest.TestCase):
         self.assertEqual(control["activity"]["state"], "SUSPENDED")
         self.assertEqual(self.service.lock.status()["state"], "free")  # lock RELEASED
 
+    def test_recover_turn_reconciles_suspended_abort(self):
+        # Simulate a crashed abort: claimed marker present + activity ACTIVE.
+        activity = self.service.store.load()["activity"]
+        claimed = self.service.state_dir / f"abort.claimed-{'a'*8}"
+        import json as _json
+        claimed.write_text(_json.dumps(
+            {"id": "a" * 8, "activity_id": activity["id"],
+             "activity_epoch": activity["epoch"]}), encoding="utf-8")
+        rec = turnmod.recover_turn(self.root, linkage="PLAN-005/STEP-01",
+                                   step="PLAN-005/STEP-01", service=self.service)
+        self.assertEqual(rec["state"], "ABORT_RECONCILED")
+        self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+        self.assertEqual(self.service.lock.status()["state"], "free")
+        self.assertFalse(list(self.service.state_dir.glob("abort.claimed-*")))
+
+    def test_recover_turn_unbound_marker_left_for_mediator(self):
+        claimed = self.service.state_dir / f"abort.claimed-{'b'*8}"
+        import json as _json
+        claimed.write_text(_json.dumps(
+            {"id": "b" * 8, "activity_id": "PLAN-OTHER", "activity_epoch": 99}),
+            encoding="utf-8")
+        rec = turnmod.recover_turn(self.root, linkage="PLAN-005/STEP-01",
+                                   step="PLAN-005/STEP-01", service=self.service)
+        self.assertEqual(rec["state"], "ABORT_MARKER_UNBOUND")
+        self.assertTrue(list(self.service.state_dir.glob("abort.claimed-*")))  # kept
+
     def test_stop_path_also_releases_lock(self):
         self.service.stop_request(reason="stop")
 
