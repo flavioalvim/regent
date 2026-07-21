@@ -24,6 +24,7 @@ _EXIT_BY_CODE = {
     "NOT_SUSPENDED": 2, "ACTIVITY_OPEN": 2,
     "TOKEN_MISMATCH": 3, "LOCK_HELD": 3, "LOCK_SUSPECT": 3, "BUSY": 3,
     "CONFLICT": 3, "UNATTRIBUTABLE": 3, "CORRUPT_CONTROL": 4, "IO": 5,
+    "ADVISOR_FAILED": 3, "ADVISOR_UNAVAILABLE": 2, "GATE_RED": 3, "PROVENANCE": 3,
 }
 
 
@@ -91,6 +92,26 @@ def build_parser(sub) -> None:
     p.add_argument("--reason", default=None)
     stop_sub.add_parser("check")
 
+    p_advisor = sub.add_parser("advisor", help="mechanized advisor consultation")
+    p_advisor.add_argument("--project", default=None)
+    advisor_sub = p_advisor.add_subparsers(dest="advisor_command", required=True)
+    p = advisor_sub.add_parser("consult")
+    p.add_argument("--prompt-file", required=True, dest="prompt_file")
+    p.add_argument("--artifact", required=True)
+    p.add_argument("--linkage", required=True)
+    p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--expect-verdict", default=None, dest="expect_verdict")
+
+    p_gate = sub.add_parser("gate", help="mechanized gate execution")
+    p_gate.add_argument("--project", default=None)
+    gate_sub = p_gate.add_subparsers(dest="gate_command", required=True)
+    p = gate_sub.add_parser("run")
+    p.add_argument("--command", required=True, dest="gate_cmd")
+    p.add_argument("--declared-in", required=True, dest="declared_in")
+    p.add_argument("--artifact", required=True)
+    p.add_argument("--linkage", required=True)
+    p.add_argument("--timeout", type=float, default=1800.0)
+
     p_control = sub.add_parser("control",
                                help="control.json attributability helpers")
     p_control.add_argument("--project", default=None)
@@ -120,6 +141,41 @@ def run(args, out=None) -> int:
         if args.command == "control":
             return _run_control_explain(service, root, out,
                                         since_version=args.since_version)
+        if args.command == "advisor":
+            from .conduction.consult import AdvisorUnavailable, run_consult
+            from .conduction.evidence import EvidenceConflict
+            try:
+                result = run_consult(root, prompt_file=Path(args.prompt_file),
+                                     artifact=Path(args.artifact),
+                                     linkage=args.linkage, timeout=args.timeout,
+                                     expect_verdict=args.expect_verdict)
+            except AdvisorUnavailable as exc:
+                return _fail("ADVISOR_UNAVAILABLE", {"reason": str(exc)}, out)
+            except EvidenceConflict as exc:
+                return _fail("CONFLICT", {"paths": exc.paths}, out)
+            if not result["ok"]:
+                return _fail("ADVISOR_FAILED",
+                             {"outcome": result["outcome"],
+                              "verdict": result["verdict"],
+                              "artifact": result["artifact"]}, out)
+            return _emit(result, 0, out)
+        if args.command == "gate":
+            from .conduction.gate import ProvenanceError, run_gate
+            from .conduction.evidence import EvidenceConflict
+            try:
+                result = run_gate(root, command=args.gate_cmd,
+                                  declared_in=Path(args.declared_in),
+                                  artifact=Path(args.artifact),
+                                  linkage=args.linkage, timeout=args.timeout)
+            except ProvenanceError as exc:
+                return _fail("PROVENANCE", {"reason": str(exc)}, out)
+            except EvidenceConflict as exc:
+                return _fail("CONFLICT", {"paths": exc.paths}, out)
+            if not result["ok"]:
+                return _fail("GATE_RED", {"outcome": result["outcome"],
+                                          "exit_code": result["exit_code"],
+                                          "artifact": result["artifact"]}, out)
+            return _emit(result, 0, out)
         return _fail("USAGE", f"unknown command {args.command!r}", out)
     except ActivityError as exc:
         return _fail(exc.code, exc.detail, out)
