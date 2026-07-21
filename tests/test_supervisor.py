@@ -121,22 +121,48 @@ class SupervisorTest(unittest.TestCase):
     def test_disarm_idempotent(self):
         self.assertFalse(sup.disarm(self.service)["disarmed"])  # nothing armed
 
-    def test_read_arm_discard_keeps_rearmed_token(self):
-        # A stale token snapshot must not delete a token that was rearmed in the
-        # window (the discard is CAS-by-arm_id under the lock).
-        stale = sup.arm(self.service, plan_id="PLAN-006", config=self._config())
-        # simulate: the caller holds `stale`, but disk now has a fresh rearm B
-        sup.disarm(self.service, arm_id=stale["arm_id"])
+    def test_read_arm_discard_cas_keeps_rearm_under_race(self):
+        # True A→B interleaving: A reads a STALE snapshot (arm_id OLD, unbound);
+        # meanwhile disk holds a fresh BOUND token B. A's discard must re-read
+        # under the lock and, seeing arm_id OLD != B, NOT delete B.
         fresh = sup.arm(self.service, plan_id="PLAN-006", config=self._config())
-        # invalidate the binding so read_arm would try to discard the *stale* one
-        def fn(body):
-            body["activity"]["turn"]["token"] = "ee" * 16
-            return body
-        self.service.store.mutate(fn)
-        # read_arm sees a non-bound token; it discards it, but only because the
-        # on-disk arm_id matches what it read — B is the current one, so B goes.
-        self.assertIsNone(sup.read_arm(self.service))
-        self.assertIsNone(sup._raw_arm(self.service.state_dir))  # removed durably
+        import regent.conduction.supervisor as mod
+        real_raw = mod._raw_arm
+        calls = {"n": 0}
+        stale = {"arm_id": "OLD", "plan_id": "PLAN-006", "activity_epoch": -1,
+                 "turn_token": "00" * 16, "config": {}}
+
+        def fake_raw(state_dir):
+            calls["n"] += 1
+            return stale if calls["n"] == 1 else real_raw(state_dir)
+        mod._raw_arm = fake_raw
+        try:
+            self.assertIsNone(sup.read_arm(self.service))  # stale → None
+        finally:
+            mod._raw_arm = real_raw
+        self.assertEqual(sup.read_arm(self.service)["arm_id"], fresh["arm_id"])  # B lives
+
+    def test_disarm_reports_false_when_unlink_fails(self):
+        # advisor finding #1 (round 2): a failed removal must NOT report success.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        import regent.conduction.supervisor as mod
+        orig = mod._unlink_durable
+        mod._unlink_durable = lambda p: (_ for _ in ()).throw(OSError("boom"))
+        try:
+            r = sup.disarm(self.service)
+        finally:
+            mod._unlink_durable = orig
+        self.assertFalse(r["disarmed"])
+        self.assertIsNotNone(sup._raw_arm(self.service.state_dir))  # still armed
+
+    def test_arm_persists_canonical_absolute_paths(self):
+        # advisor finding #3 (round 2): the token stores CANONICAL absolute paths
+        # so the daemon behaves the same from any CWD.
+        payload = sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        cfg = payload["config"]
+        for key in ("prompt_template", "declared_in", "artifact_dir"):
+            self.assertTrue(Path(cfg[key]).is_absolute(), key)
+        self.assertTrue(all(Path(p).is_absolute() for p in cfg["envelope"]))
 
     # -- arm config validation (advisor finding #4) -----------------------
 
@@ -285,6 +311,40 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(subprocess.run(
             ["git", "-C", str(self.root), "ls-files", "work/"],
             capture_output=True, text=True).stdout.strip(), "")
+
+    def test_daemon_guard_revalidates_approval(self):
+        # advisor finding #2 (round 2): APPROVAL revoked in the window between the
+        # loop's top check and the launch must stop the turn via the guard.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        import regent.conduction.loop as lm
+        import regent.conduction.supervisor as sm
+        calls = {"n": 0}
+
+        def fake_status(root, plan):
+            calls["n"] += 1
+            return "APPROVED" if calls["n"] == 1 else "CANCELLED"
+        lm_orig, sm_orig = lm._approval_status, sm._approval_status
+        lm._approval_status = fake_status
+        sm._approval_status = fake_status
+        try:
+            r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        finally:
+            lm._approval_status, sm._approval_status = lm_orig, sm_orig
+        self.assertEqual(r["final_state"], "DISARMED")
+        self.assertIsNone(sup.read_arm(self.service))
+
+    def test_daemon_streaming_exception_disarms(self):
+        # advisor finding #4 (round 2): a broken on_state sink must not escape
+        # the daemon un-disarmed.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+
+        def boom(state, extra):
+            if state == "RUNNING":
+                raise BrokenPipeError("sink gone")
+        r = sup.run_daemon(self.service, once=True,
+                           runner=_fake_agent_runner({}), on_state=boom)
+        self.assertEqual(r["final_state"], "DISARMED")
+        self.assertIsNone(sup.read_arm(self.service))
 
     def test_daemon_disarms_on_unexpected_failure(self):
         # advisor finding #4: a non-LoopError escaping run_loop must still disarm.

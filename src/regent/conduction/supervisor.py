@@ -75,11 +75,14 @@ def _fsync_dir(path: Path) -> None:
 
 
 def _unlink_durable(path: Path) -> None:
+    """Remove the token and fsync the directory so a crash after unlink cannot
+    resurrect it. A MISSING file is success; any OTHER failure PROPAGATES so the
+    caller never reports a removal that did not happen."""
     try:
         path.unlink()
-        _fsync_dir(path)  # a crash after unlink must not resurrect the token
-    except OSError:
-        pass
+    except FileNotFoundError:
+        return  # already gone == removed
+    _fsync_dir(path)  # OSError here propagates: durability is not assured
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -104,12 +107,15 @@ def _raw_arm(state_dir: Path) -> dict | None:
         return None
 
 
-def _validate_arm_config(root: Path, plan_id: str, config: dict) -> None:
+def _validate_arm_config(root: Path, plan_id: str, config: dict) -> dict:
     """A daemon armed with a broken config would fail LATE (or, worse, drive an
     empty plan straight to STEPS_COMPLETE). Validate the whole loop config up
-    front, at arm time, so a bad arm never succeeds."""
+    front, at arm time, so a bad arm never succeeds — and return a CANONICAL
+    copy with every path resolved to an ABSOLUTE one, so the daemon behaves
+    identically no matter which directory it is launched from."""
     plan_dir = (root / ".regent" / "plans" / plan_id).resolve()
-    if not Path(config.get("prompt_template", "")).is_file():
+    template = Path(config.get("prompt_template", ""))
+    if not template.is_file():
         raise SupervisorError("NOT_EXECUTABLE",
                               {"reason": "prompt_template not a file"})
     declared_in = Path(config.get("declared_in", ""))
@@ -138,6 +144,15 @@ def _validate_arm_config(root: Path, plan_id: str, config: dict) -> None:
     envelope = config.get("envelope") or []
     if not isinstance(envelope, list) or not envelope:
         raise SupervisorError("NOT_EXECUTABLE", {"reason": "envelope required"})
+    canonical = dict(config)
+    canonical["prompt_template"] = str(template.resolve())
+    canonical["declared_in"] = str(resolved)
+    canonical["artifact_dir"] = str(art_resolved)
+    canonical["envelope"] = [str(Path(p).resolve()) for p in envelope]
+    if config.get("gate_envelope"):
+        canonical["gate_envelope"] = [str(Path(p).resolve())
+                                      for p in config["gate_envelope"]]
+    return canonical
 
 
 def arm(service: ActivityService, *, plan_id: str, config: dict) -> dict:
@@ -154,7 +169,7 @@ def arm(service: ActivityService, *, plan_id: str, config: dict) -> dict:
             if existing is not None and existing.get("plan_id") != plan_id:
                 raise SupervisorError("ALREADY_ARMED",
                                       {"armed_plan": existing.get("plan_id")})
-            _validate_arm_config(root, plan_id, config)
+            config = _validate_arm_config(root, plan_id, config)  # canonicalized
             control = service.store.load()
             activity = control.get("activity")
             if activity is None or activity["state"] != "ACTIVE" \
@@ -205,7 +220,10 @@ def read_arm(service: ActivityService) -> dict | None:
                 service.audit.append({"event": "arm_token_discarded",
                                       "arm_id": payload.get("arm_id"),
                                       "reason": "binding no longer current"})
-                _unlink_durable(_arm_path(service.state_dir))
+                try:
+                    _unlink_durable(_arm_path(service.state_dir))
+                except OSError:
+                    pass  # leave it; re-evaluated next cycle (never claims removed)
     except MutationMutexBusy:
         pass
     return None
@@ -221,7 +239,10 @@ def disarm(service: ActivityService, *, arm_id: str | None = None) -> dict:
                 return {"disarmed": False, "reason": "no arm token"}
             if arm_id is not None and payload.get("arm_id") != arm_id:
                 return {"disarmed": False, "reason": "arm_id mismatch (rearmed)"}
-            _unlink_durable(_arm_path(service.state_dir))
+            try:
+                _unlink_durable(_arm_path(service.state_dir))
+            except OSError as exc:  # never report a removal that did not happen
+                return {"disarmed": False, "reason": f"unlink failed: {exc}"}
             return {"disarmed": True, "arm_id": payload.get("arm_id")}
     except MutationMutexBusy:
         return {"disarmed": False, "reason": "arm lock busy"}
@@ -249,8 +270,14 @@ def run_daemon(service: ActivityService, *, poll: float = 5.0,
 
     def emit(state: str, extra: dict | None = None) -> None:
         transitions.append(state)
-        if on_state is not None:
+        if on_state is None:
+            return
+        try:
             on_state(state, extra or {})
+        except Exception:  # noqa: BLE001 — a broken sink (e.g. BrokenPipeError)
+            # must never escape un-disarmed; flag a stop so the guard halts the
+            # loop and the terminal path disarms cleanly.
+            stopping["flag"] = True
 
     try:
         while True:
@@ -275,10 +302,15 @@ def run_daemon(service: ActivityService, *, poll: float = 5.0,
             arm_id = armed["arm_id"]
             conclusion = _conclusion_path(root, armed["plan_id"])
 
-            def guard(_arm_id=arm_id, _conc=conclusion) -> bool:
+            plan = armed["plan_id"]
+
+            def guard(_arm_id=arm_id, _conc=conclusion, _plan=plan) -> bool:
                 # Bar STARTING the next turn on: a signal, a mediated conclusion
-                # appearing mid-run, or the arm being removed/rearmed.
+                # appearing mid-run, APPROVAL revoked after the loop's own check,
+                # or the arm being removed/rearmed.
                 if stopping["flag"] or _conc.exists():
+                    return False
+                if _approval_status(root, _plan) != "APPROVED":
                     return False
                 cur = read_arm(service)
                 return cur is not None and cur["arm_id"] == _arm_id
