@@ -28,6 +28,9 @@ _EXIT_BY_CODE = {
     "TURN_VIOLATION": 3, "TURN_TAMPERED": 3, "TURN_FAILED": 3, "NOT_ACTIVE": 2,
     "STEP_MISMATCH": 2, "ARTIFACT_OUTSIDE_REGENT": 2, "STEP_ALREADY_DONE": 2,
     "WORKTREE_DIRTY": 3,
+    "LOOP_HALTED": 3, "LOOP_ABORTED": 3, "LOOP_MAX_TURNS": 3, "LOOP_STOPPED": 2,
+    "LOOP_BUSY": 3, "PLAN_NOT_EXECUTABLE": 2, "LOOP_CONFLICT": 3, "LOOP_DIRTY": 3,
+    "LOOP_MISCONFIGURED": 2, "ABORT_PENDING": 3,
 }
 
 
@@ -105,6 +108,22 @@ def build_parser(sub) -> None:
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--expect-verdict", default=None, dest="expect_verdict")
 
+    p_loop = sub.add_parser("loop", help="chain supervised turns over a plan")
+    p_loop.add_argument("--project", default=None)
+    loop_sub = p_loop.add_subparsers(dest="loop_command", required=True)
+    p = loop_sub.add_parser("run")
+    p.add_argument("--plan", required=True)
+    p.add_argument("--prompt-template", required=True, dest="prompt_template")
+    p.add_argument("--envelope", action="append", required=True)
+    p.add_argument("--gate-envelope", action="append", default=[], dest="gate_envelope")
+    p.add_argument("--declared-in", required=True, dest="declared_in")
+    p.add_argument("--artifact-dir", required=True, dest="artifact_dir")
+    p.add_argument("--max-turns", type=int, default=20, dest="max_turns")
+    p.add_argument("--timeout", type=float, default=900.0)
+    p.add_argument("--claude-bin", default="claude", dest="claude_bin")
+    p = loop_sub.add_parser("abort")
+    p.add_argument("--reason", required=True)
+
     p_turn = sub.add_parser("turn", help="supervised confined production turn")
     p_turn.add_argument("--project", default=None)
     turn_sub = p_turn.add_subparsers(dest="turn_command", required=True)
@@ -178,6 +197,41 @@ def run(args, out=None) -> int:
                               "exit_code": result["exit_code"],
                               "verdict": result["verdict"],
                               "artifact": result["artifact"]}, out)
+            return _emit(result, 0, out)
+        if args.command == "loop":
+            if args.loop_command == "abort":
+                from .conduction.abort import AbortPending, write_abort_request
+                control = service.store.load()
+                activity = control.get("activity")
+                if activity is None:
+                    return _fail("NO_ACTIVITY", {"state": "idle"}, out)
+                token = (activity.get("turn") or {}).get("token")
+                try:
+                    req = write_abort_request(
+                        service.state_dir, activity_id=activity["id"],
+                        activity_epoch=activity["epoch"], turn_token=token,
+                        reason=args.reason)
+                except AbortPending:
+                    return _fail("ABORT_PENDING", {"reason": "an abort is already "
+                                                   "pending"}, out)
+                return _emit({"ok": True, "abort_id": req["id"]}, 0, out)
+            from .conduction.loop import LoopError, run_loop
+            try:
+                result = run_loop(
+                    root, plan_id=args.plan, prompt_template=Path(args.prompt_template),
+                    envelope=args.envelope, gate_envelope=args.gate_envelope,
+                    declared_in=Path(args.declared_in),
+                    artifact_dir=Path(args.artifact_dir), max_turns=args.max_turns,
+                    timeout=args.timeout, claude_bin=args.claude_bin)
+            except LoopError as exc:
+                return _fail(exc.code, exc.detail, out)
+            if not result["ok"]:
+                cond = result["stop_condition"]
+                code = {"HALTED": "LOOP_HALTED", "ABORTED": "LOOP_ABORTED",
+                        "MAX_TURNS": "LOOP_MAX_TURNS", "STOPPED": "LOOP_STOPPED",
+                        }.get(cond, cond if cond in _EXIT_BY_CODE else "LOOP_HALTED")
+                return _fail(code, {"stop_condition": cond, "turns": result["turns"],
+                                    "count": result["count"]}, out)
             return _emit(result, 0, out)
         if args.command == "turn":
             from .conduction.turn import TurnError, run_turn

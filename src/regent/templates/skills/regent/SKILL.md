@@ -67,8 +67,12 @@ executable gate) → advisor review (+1 rebuttal cycle) → `APPROVAL.md`
 (`status: APPROVED|REJECTED|CANCELLED` + actor) → `regent activity conclude --status
 <approval status>` + operational commit.
 
-**Build** — two ways to execute a step. **Confined (preferred when the step is bounded to
-files):** `regent turn run --prompt-file <task> --envelope <path> [--envelope ...]
+**Build** — three ways. **Whole plan (preferred, hands-off):** `regent loop run --plan
+PLAN-NNN --prompt-template <task-template with {step}/{gate}> --envelope <path>
+--declared-in <PLAN.md> --artifact-dir <build dir> [--max-turns N]` chains confined turns
+until COMPLETE / HALTED / STOPPED / ABORTED / MAX_TURNS; `regent loop abort --reason R`
+cancels the in-flight turn (suspends, resume with /regent). **One step (confined):**
+`regent turn run --prompt-file <task> --envelope <path> [--envelope ...]
 --gate-command "<step gate>" --declared-in <PLAN.md> --step PLAN-NNN/STEP-NN
 --artifact-dir <build dir under .regent> --linkage PLAN-NNN/STEP-NN` — launches a confined
 `claude -p` that may only write inside the envelope (hook denies the rest), then the
