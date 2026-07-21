@@ -99,8 +99,22 @@ def pending_claimed(state_dir: Path) -> list[Path]:
     return sorted(Path(state_dir).glob("abort.claimed-*"))
 
 
-def clear_claimed(state_dir: Path) -> None:
+def clear_claimed(state_dir: Path, *, activity_id: str | None = None,
+                  activity_epoch: int | None = None,
+                  turn_token: str | None = None) -> None:
+    """Removes claimed markers. If a binding is given, ONLY markers matching it
+    (never unrelated aborts)."""
+    import json as _json
     for p in pending_claimed(state_dir):
+        if activity_id is not None:
+            try:
+                m = _json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not (m.get("activity_id") == activity_id
+                    and m.get("activity_epoch") == activity_epoch
+                    and m.get("turn_token") == turn_token):
+                continue  # a different abort — leave it
         try:
             p.unlink()
         except OSError:

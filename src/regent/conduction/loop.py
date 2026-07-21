@@ -188,8 +188,8 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
       try:
         summary_conflict = _write_loop_evidence(root, artifact_dir, service,
                                                 condition, turns)
-        if summary_conflict and condition == "COMPLETE":
-            condition = "LOOP_CONFLICT"  # a mandatory summary could not commit
+        if summary_conflict:
+            condition = "LOOP_CONFLICT"  # summary could not commit (any prior cond)
       except subprocess.CalledProcessError:
         condition = "LOOP_CONFLICT"  # any git error in the summary is a conflict
     finally:

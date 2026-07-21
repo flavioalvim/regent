@@ -180,7 +180,8 @@ class TurnAbortIntegrationTest(unittest.TestCase):
         import json as _json
         claimed.write_text(_json.dumps(
             {"id": "a" * 8, "activity_id": activity["id"],
-             "activity_epoch": activity["epoch"]}), encoding="utf-8")
+             "activity_epoch": activity["epoch"],
+             "turn_token": activity["turn"]["token"]}), encoding="utf-8")
         rec = turnmod.recover_turn(self.root, linkage="PLAN-005/STEP-01",
                                    step="PLAN-005/STEP-01", service=self.service)
         self.assertEqual(rec["state"], "ABORT_RECONCILED")

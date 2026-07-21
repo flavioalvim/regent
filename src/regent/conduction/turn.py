@@ -131,8 +131,10 @@ def recover_turn(root: Path, *, linkage: str, step: str,
             marker = _json.loads(claimed[0].read_text(encoding="utf-8"))
         except (OSError, ValueError):
             marker = {}
+        cur_token = (activity.get("turn") or {}).get("token")
         bound = (marker.get("activity_id") == activity.get("id")
-                 and marker.get("activity_epoch") == activity.get("epoch"))
+                 and marker.get("activity_epoch") == activity.get("epoch")
+                 and marker.get("turn_token") == cur_token)  # token too (fencing)
         if activity.get("state") == "SUSPENDED":
             if bound and service.lock.status()["state"] == "free":
                 _abort.clear_claimed(service.state_dir)
@@ -322,10 +324,18 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     # ABORTED suspends (app layer releases the lock), then reconciles the
     # claimed abort marker — idempotent recovery point.
     if outcome == "ABORTED":
+        # commit the TURN evidence operationally BEFORE clearing the marker so
+        # there is a durable ABORTED record even if we crash right after; the
+        # activity is still ACTIVE here (suspend happens next), so this is a
+        # fenced op-commit.
+        op = _operational_commit(root, base_sha, [str(artifact.relative_to(root))],
+                                 linkage=linkage, outcome="ABORTED", token=token,
+                                 service=service)
         _stopped_suspend(service, token, "LAUNCHED", reason="abort requested")
-        _abort.clear_claimed(service.state_dir)
+        _abort.clear_claimed(service.state_dir, activity_id=activity["id"],
+                             activity_epoch=activity["epoch"], turn_token=token)
         return {"ok": False, "outcome": "ABORTED", "files_committed": [],
-                "artifact": str(artifact), "commit": None, "detail": detail}
+                "artifact": str(artifact), "commit": op, "detail": detail}
 
     # -- COMMITTED (supervisor only) --------------------------------------
     # A stop that arrived during verify/attribute/evidence (for ANY outcome)
