@@ -1,4 +1,4 @@
-# PLAN-003 (v2) — Condução fase 1: advisor consult e gate run mecanizados
+# PLAN-003 (v3) — Condução fase 1: advisor consult e gate run mecanizados
 
 *v2 após ADVISOR-REVIEW-1 (5 objeções incorporadas — ver CLAUDE-REBUTTAL.md): proveniência
 obrigatória do comando de gate (--declared-in + verbatim, erro PROVENANCE); --expect-verdict
@@ -42,19 +42,37 @@ HMAC), `--abort` real, decisão automática de turno, ensaio; publicação PyPI.
   `^(CONCORDA|DISCORDA.*|APROVADO( COM RESSALVAS)?|REPROVADO|QUITADAS|PENDENTES.*)$`);
   sem casamento → `verdict: null`.
 - stdout JSON: `{"ok": bool, "outcome": ..., "verdict": str|null, "artifact": path,
-  "prompt_copy": path}`; exit 0 SÓ com outcome SUCCESS (fail-closed: TIMEOUT/FAILURE →
-  exit 3 com envelope `{"error": "ADVISOR_FAILED", "detail": {"outcome", "exit_code"}}`
-  — código novo no catálogo, extensão declarada). Advisor ausente → capacidade:
+  "prompt_copy": path}`. **Exit 0 exige outcome SUCCESS E, quando `--expect-verdict` foi
+  passado explicitamente, verdict casado** — SUCCESS sem casamento com a flag explícita =
+  `ADVISOR_FAILED` exit 3 (o artefato fica persistido com `verdict: null`). TIMEOUT/
+  FAILURE → exit 3, envelope `{"error": "ADVISOR_FAILED", "detail": {"outcome",
+  "exit_code", "verdict"}}` (código novo declarado). Advisor ausente →
   `{"error": "ADVISOR_UNAVAILABLE"}` exit 2 (código novo declarado).
+- **Par atômico (contrato único):** pré-checagem dos DOIS caminhos (`<artifact>` e
+  `<artifact>-PROMPT.md`) ANTES de qualquer escrita — qualquer um pré-existente =
+  `CONFLICT`, nada é tocado. Ordem de commit: prompt-copy primeiro (tmp+replace),
+  artefato por último (tmp+replace). TODO desfecho terminal (SUCCESS/TIMEOUT/FAILURE)
+  deixa o par completo; falha NÃO-terminal (ex.: IO na escrita do artefato) remove a
+  cópia órfã do prompt e retorna `IO` — nunca fica meio par.
+- **Timeout operacional:** o processo do codex é lançado com `start_new_session=True`
+  (novo grupo); estourado o `--timeout`, TODO o grupo recebe `SIGKILL` via `killpg` antes
+  de o desfecho `TIMEOUT` ser registrado — nenhum filho sobrevive ao resultado.
 
 ### `regent gate run`
 `regent gate run --command "<shell>" --declared-in <plan-artifact> --artifact <path-out>
 --linkage <str> [--timeout <s=1800>]` — o comando DEVE constar verbatim no artefato
 referenciado (senão erro `PROVENANCE`, código novo declarado)
-- Executa via `bash -c` no root do host; captura stdout+stderr combinados (cauda de até
-  200 KiB no artefato, tamanho integral registrado) e exit code.
+- Executa via `bash -c` no root do host, com `start_new_session=True`; no `--timeout`,
+  `killpg(SIGKILL)` no grupo INTEIRO antes de registrar `TIMEOUT` (nenhum filho — nem os
+  disparados pelo bash — sobrevive ao desfecho).
+- Captura stdout+stderr combinados. **Íntegra sempre preservada:** saída ≤200 KiB fica
+  inline no artefato; acima disso, o artefato guarda header+cauda com truncagem DECLARADA
+  (tamanho total em bytes) e a íntegra vai para `<artifact>-FULL.log` — que integra o PAR
+  do gate com o MESMO contrato atômico: pré-checagem dos dois caminhos (`CONFLICT` se
+  qualquer um existir), FULL.log primeiro (tmp+replace), artefato por último; desfecho
+  terminal sempre deixa o conjunto completo; falha não-terminal remove o FULL.log órfão.
 - SEMPRE persiste o artefato com cabeçalho (`outcome: GREEN|RED|TIMEOUT`, `exit_code`,
-  `timestamp`, `linkage`, `command`); escrita atômica; pré-existente = `CONFLICT`.
+  `timestamp`, `linkage`, `command`, `output_bytes`, `truncated: bool`).
 - stdout JSON `{"ok": bool, "outcome": ..., "exit_code": int|null, "artifact": path}`;
   exit 0 SÓ com GREEN; RED/TIMEOUT → exit 3, envelope `{"error": "GATE_RED",
   "detail": {...}}` (código novo declarado). O comando NUNCA é inventado pelo regent —
