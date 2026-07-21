@@ -86,7 +86,7 @@ def _approval_status(root: Path, plan_id: str) -> str | None:
 def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[str],
              gate_envelope: list[str] | None, declared_in: Path, artifact_dir: Path,
              max_turns: int = 20, timeout: float = 900.0, claude_bin: str = "claude",
-             runner=None, service: ActivityService | None = None) -> dict:
+             runner=None, service: ActivityService | None = None, guard=None) -> dict:
     root = Path(root).resolve()
     service = service or ActivityService(root)
     artifact_dir = (root / artifact_dir).resolve() if not Path(artifact_dir).is_absolute() \
@@ -123,6 +123,9 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
                 break
             if len(turns) >= max_turns:
                 condition = "MAX_TURNS"
+                break
+            if guard is not None and not guard():  # revalidate arm before each turn
+                condition = "DISARMED"
                 break
             step = remaining[0]
             gate = _step_gate(plan_text, step)
