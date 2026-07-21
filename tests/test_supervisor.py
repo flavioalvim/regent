@@ -1,4 +1,4 @@
-"""Directed tests for rehearse + arm/disarm (PLAN-006 STEP-01)."""
+"""Directed tests for rehearse + arm/disarm + daemon (PLAN-006)."""
 
 import subprocess
 import tempfile
@@ -7,6 +7,7 @@ from pathlib import Path
 
 from regent.activity import ActivityService
 from regent.conduction import supervisor as sup
+from tests.test_loop import _fake_agent_runner
 
 
 class SupervisorTest(unittest.TestCase):
@@ -119,6 +120,111 @@ class SupervisorTest(unittest.TestCase):
 
     def test_disarm_idempotent(self):
         self.assertFalse(sup.disarm(self.service)["disarmed"])  # nothing armed
+
+    def test_arm_token_stale_after_takeover_ignored(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        # rotate the token (as a takeover would) without changing the epoch
+        def fn(body):
+            body["activity"]["turn"]["token"] = "ff" * 16
+            return body
+        self.service.store.mutate(fn)
+        self.assertIsNone(sup.read_arm(self.service))  # discarded
+
+    def test_disarm_cas_old_id_does_not_remove_rearm(self):
+        first = sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        sup.disarm(self.service, arm_id=first["arm_id"])
+        second = sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        # the OLD daemon tries to disarm with the stale id — must NOT remove B
+        r = sup.disarm(self.service, arm_id=first["arm_id"])
+        self.assertFalse(r["disarmed"])
+        self.assertEqual(sup.read_arm(self.service)["arm_id"], second["arm_id"])
+
+    # -- daemon (STEP-02) -------------------------------------------------
+
+    def test_daemon_idle_without_arm(self):
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "IDLE")
+
+    def test_daemon_once_single_cycle(self):
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["transitions"], ["IDLE"])  # exactly one cycle, no loop
+
+    def test_daemon_never_acts_on_unarmed_plan(self):
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "IDLE")
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root), "ls-files", "work/"],
+            capture_output=True, text=True).stdout.strip(), "")  # no turn ran
+
+    def test_daemon_drives_armed_plan_to_complete(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "STEPS_COMPLETE")
+        self.assertEqual(r["turns"], 2)
+
+    def test_daemon_reports_steps_complete_not_accepted(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "STEPS_COMPLETE")  # NOT "ACCEPTED"
+        # the daemon does NOT conclude the activity — that is mediated
+        self.assertEqual(self.service.store.load()["activity"]["state"], "ACTIVE")
+        self.assertFalse((self.artdir / "CONCLUSION.md").exists())
+
+    def test_daemon_disarms_after_complete(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertIsNone(sup.read_arm(self.service))
+
+    def test_daemon_disarms_on_halted(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        r = sup.run_daemon(self.service, once=True,
+                           runner=_fake_agent_runner({"STEP-01": "noop"}))
+        self.assertEqual(r["final_state"], "HALTED")
+        self.assertIsNone(sup.read_arm(self.service))
+
+    def test_daemon_disarms_on_stopped(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        self.service.stop_request(reason="owner stops")
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "STOPPED")
+        self.assertIsNone(sup.read_arm(self.service))
+
+    def test_daemon_respects_stop_request(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        self.service.stop_request(reason="owner stops")
+        r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        self.assertEqual(r["final_state"], "STOPPED")
+        # the stop was honored BEFORE any turn ran
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root), "ls-files", "work/"],
+            capture_output=True, text=True).stdout.strip(), "")
+
+    def _disarming_runner(self):
+        """Wraps the fake agent so it disarms right after STEP-01's turn — the
+        loop guard must then refuse to START STEP-02 (DISARMED)."""
+        inner = _fake_agent_runner({})
+        service = self.service
+
+        class Runner:
+            def run(self, argv, *, cwd, timeout, env=None, cancel=None):
+                result = inner.run(argv, cwd=cwd, timeout=timeout, env=env, cancel=cancel)
+                if argv and argv[0] != "bash" and "STEP-01" in argv[argv.index("-p") + 1]:
+                    sup.disarm(service)  # owner disarms mid-run
+                return result
+        return Runner()
+
+    def test_daemon_guard_disarm_stops_between_turns(self):
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        r = sup.run_daemon(self.service, once=True, runner=self._disarming_runner())
+        self.assertEqual(r["final_state"], "DISARMED")
+        self.assertIsNone(sup.read_arm(self.service))
+
+    def test_daemon_stops_on_disarm_between_cycles(self):
+        # even with once=False, a disarm mid-run returns DISARMED and does not
+        # loop back to re-arm on its own.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        r = sup.run_daemon(self.service, once=False, runner=self._disarming_runner())
+        self.assertEqual(r["final_state"], "DISARMED")
 
 
 if __name__ == "__main__":

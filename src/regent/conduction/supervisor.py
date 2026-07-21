@@ -1,21 +1,25 @@
-"""Conduction phase 4 (PLAN-006), STEP-01: rehearsal + the durable arm/disarm
-safety gate. The foreground daemon supervisor arrives in STEP-02.
+"""Conduction phase 4 (PLAN-006): rehearsal, the durable arm/disarm safety
+gate, and the foreground daemon supervisor.
 
-Safety is the point: the daemon (STEP-02) is autonomous PER TURN but never per
-the decision to START. Without a valid arm-token issued by the owner it never
-drives; the arm-token is the owner's durable, activity-bound authorization.
+Safety is the point: the daemon is autonomous PER TURN but never per the
+decision to START. Without a valid arm-token issued by the owner it never
+drives; any non-STEPS_COMPLETE terminal condition disarms; a loop COMPLETE
+means "steps done", NOT "build accepted" — the final review, CONCLUSION.md and
+`activity conclude` stay a MEDIATED decision (`/regent`), not the daemon's.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
+import time
 import uuid
 from pathlib import Path
 
 from ..activity import ActivityService
-from .loop import (_approval_status, _attempt_number, _committed_steps,
-                   _declared_steps, _step_gate)
+from .loop import (LoopError, _approval_status, _attempt_number, _committed_steps,
+                   _declared_steps, _step_gate, run_loop)
 
 
 class SupervisorError(Exception):
@@ -147,6 +151,94 @@ def disarm(service: ActivityService, *, arm_id: str | None = None) -> dict:
     except OSError:
         pass
     return {"disarmed": True, "arm_id": payload.get("arm_id")}
+
+
+# -- foreground daemon ----------------------------------------------------
+
+def run_daemon(service: ActivityService, *, poll: float = 5.0,
+               claude_bin: str = "claude", once: bool = False,
+               runner=None, on_state=None) -> dict:
+    """Foreground supervisor. Drives an ARMED build via run_loop, re-checking the
+    arm before every turn (guard). It never STARTS work without a valid arm-token
+    and DISARMS on every terminal condition — including COMPLETE, which it reports
+    as STEPS_COMPLETE (the mediated final review/CONCLUSION/conclude is the
+    owner's). SIGINT/SIGTERM disarm and exit."""
+    root = service.root
+    stopping = {"flag": False}
+
+    def _sig(_signum, _frame):
+        stopping["flag"] = True
+    old_int = signal.signal(signal.SIGINT, _sig)
+    old_term = signal.signal(signal.SIGTERM, _sig)
+    transitions: list[str] = []
+
+    def emit(state: str, extra: dict | None = None) -> None:
+        transitions.append(state)
+        if on_state is not None:
+            on_state(state, extra or {})
+
+    try:
+        while True:
+            if stopping["flag"]:
+                disarm(service)
+                emit("SIGNALLED")
+                return _result("SIGNALLED", transitions)
+            armed = read_arm(service)
+            if armed is None:
+                emit("IDLE")
+                if once:
+                    return _result("IDLE", transitions)
+                time.sleep(poll)
+                continue
+            if service.stop_check()["stop_requested"]:
+                disarm(service, arm_id=armed["arm_id"])
+                emit("STOPPED")
+                return _result("STOPPED", transitions)
+
+            emit("RUNNING", {"plan": armed["plan_id"], "arm_id": armed["arm_id"]})
+            cfg = armed["config"]
+            arm_id = armed["arm_id"]
+
+            def guard(_arm_id=arm_id) -> bool:
+                if stopping["flag"]:
+                    return False
+                cur = read_arm(service)
+                return cur is not None and cur["arm_id"] == _arm_id
+
+            try:
+                result = run_loop(
+                    root, plan_id=armed["plan_id"],
+                    prompt_template=Path(cfg["prompt_template"]),
+                    envelope=cfg["envelope"], gate_envelope=cfg.get("gate_envelope"),
+                    declared_in=Path(cfg["declared_in"]),
+                    artifact_dir=Path(cfg["artifact_dir"]),
+                    max_turns=cfg.get("max_turns", 20),
+                    timeout=cfg.get("timeout", 900.0), claude_bin=claude_bin,
+                    runner=runner, service=service, guard=guard)
+            except LoopError as exc:
+                disarm(service, arm_id=arm_id)
+                emit(exc.code)
+                return _result(exc.code, transitions)
+
+            cond = result["stop_condition"]
+            # A loop COMPLETE = steps done, NOT accepted: report STEPS_COMPLETE
+            # and disarm; the mediated final review/CONCLUSION/conclude is the
+            # owner's, never the daemon's.
+            state = "STEPS_COMPLETE" if cond == "COMPLETE" else cond
+            disarm(service, arm_id=arm_id)  # every terminal condition disarms
+            emit(state, {"turns": result["count"]})
+            return _result(state, transitions, turns=result["count"])
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+
+
+_TERMINAL_OK = {"STEPS_COMPLETE", "IDLE", "SIGNALLED"}
+
+
+def _result(state: str, transitions: list[str], **extra) -> dict:
+    return {"final_state": state, "ok": state in _TERMINAL_OK,
+            "transitions": transitions, **extra}
 
 
 def _now() -> str:
