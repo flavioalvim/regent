@@ -71,7 +71,36 @@ def _step_gate(plan_text: str, step_name: str) -> str | None:
 
 
 def _set_phase(service: ActivityService, phase: str) -> None:
-    (service.state_dir / "turn.phase").write_text(phase, encoding="utf-8")
+    """Durable checkpoint (atomic tmp+replace+fsync) in the disposable XDG state."""
+    target = service.state_dir / "turn.phase"
+    tmp = target.with_name(".turn.phase.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, phase.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, target)
+
+
+def recover_turn(root: Path, *, linkage: str, step: str,
+                 service: ActivityService | None = None) -> dict:
+    """Recovery by inspection (PLAN-004): trailer → STEP file → worktree. Never
+    resumes mid-agent; a partial turn leaves a dirty worktree for the mediator."""
+    root = Path(root).resolve()
+    service = service or ActivityService(root)
+    plan_id, step_name = step.split("/", 1)
+    step_file = root / ".regent" / "plans" / plan_id / "build" / f"{step_name}.md"
+    log = _git(root, "log", "--grep", f"Regent-Turn: {re.escape(linkage)}",
+               "--format=%H")
+    if log.strip():
+        return {"state": "COMMITTED", "commit": log.splitlines()[0]}
+    if step_file.exists():
+        return {"state": "STEP_DONE", "step_file": str(step_file)}
+    if _dirty_non_exempt(root):
+        return {"state": "PARTIAL", "action": "mediator must inspect/discard the "
+                "worktree; a mid-agent turn is never auto-resumed"}
+    return {"state": "CLEAN", "action": "rerun the turn"}
 
 
 def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
@@ -103,8 +132,11 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     if declared_in != expected_plan:
         raise TurnError("STEP_MISMATCH", {"declared_in": str(declared_in),
                                           "expected": str(expected_plan)})
-    if not _under(root / ".regent", artifact_dir):
-        raise TurnError("ARTIFACT_OUTSIDE_REGENT", {"artifact_dir": str(artifact_dir)})
+    canonical_build = (root / ".regent" / "plans" / plan_id / "build").resolve()
+    if artifact_dir != canonical_build:
+        raise TurnError("ARTIFACT_OUTSIDE_REGENT",
+                        {"artifact_dir": str(artifact_dir),
+                         "expected": str(canonical_build)})
     plan_text = declared_in.read_text(encoding="utf-8", errors="replace")
     current = _current_step(plan_text, artifact_dir)
     if current != step_name:
@@ -127,6 +159,7 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     turn = compose(envelope=envelope, claude_bin=claude_bin)
     artifact = artifact_dir / f"TURN-{_slug(linkage)}.md"
     gate_artifact = artifact_dir / f"GATE-{step_name}.md"
+    gate_full = artifact_dir / f"GATE-{step_name}.md-FULL.log"
     evidence = EvidenceSet(artifact, {})
     evidence.precheck()
     outcome, claude_exit, attributed, commit_sha, detail = "FAILURE", None, [], None, ""
@@ -153,9 +186,11 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
         elif result.exit_code not in (0, None):
             outcome, detail = "FAILURE", f"claude exited {result.exit_code}"
         else:
-            # -- GATED (keep-alive still running; heartbeat first) --------
+            # -- GATED (keep-alive still running; heartbeat + stop check) --
             _set_phase(service, "GATED")
             service.heartbeat()
+            if service.stop_check()["stop_requested"]:
+                raise TurnError("STOPPED", {"phase": "GATED"})
             try:
                 gate = run_gate(root, command=gate_command, declared_in=declared_in,
                                 artifact=gate_artifact, linkage=step, runner=run)
@@ -168,8 +203,8 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             # -- VERIFIED -------------------------------------------------
             _set_phase(service, "VERIFIED")
             exemption_files = EXEMPTIONS + [
-                str(gate_artifact.relative_to(root)), str(artifact.relative_to(root)),
-                str(step_file.relative_to(root))]
+                str(gate_artifact.relative_to(root)), str(gate_full.relative_to(root)),
+                str(artifact.relative_to(root)), str(step_file.relative_to(root))]
             try:
                 verify_chain(turn.event_log, turn.secret)
                 attributed = attribute_changes(
@@ -201,15 +236,19 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     if outcome == "TURN_OK":
         _write_step_file(step_file, step_name, attributed, base_sha, linkage,
                          gate_command)
-        commit_sha = _supervisor_commit(
-            root, base_sha, attributed + [
-                str(step_file.relative_to(root)), str(artifact.relative_to(root)),
-                str(gate_artifact.relative_to(root))],
-            step=step, linkage=linkage, token=token, service=service)
+        product_evidence = [str(step_file.relative_to(root)),
+                            str(artifact.relative_to(root)),
+                            str(gate_artifact.relative_to(root))]
+        if gate_full.exists():
+            product_evidence.append(str(gate_full.relative_to(root)))
+        commit_sha = _supervisor_commit(root, base_sha, attributed + product_evidence,
+                                        step=step, linkage=linkage, token=token,
+                                        service=service)
     else:
-        extra = [str(gate_artifact.relative_to(root))] if gate_artifact.exists() else []
+        extra = [str(p.relative_to(root)) for p in (gate_artifact, gate_full)
+                 if p.exists()]
         commit_sha = _operational_commit(
-            root, [str(artifact.relative_to(root))] + extra,
+            root, base_sha, [str(artifact.relative_to(root))] + extra,
             linkage=linkage, outcome=outcome, token=token, service=service)
     _set_phase(service, "COMMITTED")
 
@@ -275,16 +314,34 @@ def _supervisor_commit(root: Path, base_sha: str, paths: list[str], *, step: str
             pass
 
 
-def _operational_commit(root: Path, paths: list[str], *, linkage: str,
-                        outcome: str, token: str, service: ActivityService) -> str | None:
+def _operational_commit(root: Path, base_sha: str, paths: list[str], *,
+                        linkage: str, outcome: str, token: str,
+                        service: ActivityService) -> str | None:
+    """Same fencing+CAS discipline as the product commit: private index,
+    token re-check and update-ref <new> <old> in the smallest window."""
+    index = Path(tempfile.mktemp(prefix="regent-index-"))
+    env = dict(os.environ, GIT_INDEX_FILE=str(index))
     try:
+        _git(root, "read-tree", "HEAD", env=env)
+        for path in paths:
+            _git(root, "add", "--", path, env=env)
+        base_tree = _git(root, "rev-parse", "HEAD^{tree}").strip()
+        tree = _git(root, "write-tree", env=env).strip()
+        if tree == base_tree:
+            return None
+        msg = (f"turn(PLAN-004): {outcome} evidence (no product)\n\n"
+               f"Regent-Turn: {linkage}")
+        commit = _git(root, "commit-tree", tree, "-p", base_sha, "-m", msg,
+                      env=env).strip()
         assert_turn_token(service.store.load(), token)
-    except NotLockOwner:
-        raise TurnError("CONFLICT", {"reason": "token diverged before commit"})
-    for path in paths:
-        _git(root, "add", "--", path)
-    if not _git(root, "diff", "--cached", "--name-only").strip():
-        return None
-    _git(root, "commit", "-q", "-m",
-         f"turn(PLAN-004): {outcome} evidence (no product)\n\nRegent-Turn: {linkage}")
-    return _git(root, "rev-parse", "HEAD").strip()
+        if _git(root, "rev-parse", "HEAD").strip() != base_sha:
+            raise TurnError("CONFLICT", {"reason": "HEAD moved since baseline"})
+        _git(root, "update-ref", "-m", "regent turn (op)", "HEAD", commit, base_sha,
+             env=env)
+        _git(root, "reset", "--mixed", "HEAD")
+        return commit
+    finally:
+        try:
+            index.unlink()
+        except OSError:
+            pass

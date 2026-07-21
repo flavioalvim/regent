@@ -135,12 +135,12 @@ def attribute_changes(root: Path, events: list[dict], *, envelope: list[str],
     allowed_pre = {(e.get("tool_use_id"), _rel(root, p))
                    for e in events if e.get("kind") == "pre"
                    and e.get("decision") == "allow" for p in e.get("paths", [])}
-    posts: dict[str, str | None] = {}
+    posts: dict[str, dict] = {}
     for e in events:
         if e.get("kind") == "post" and e.get("path"):
             rel = _rel(root, e["path"])
             if (e.get("tool_use_id"), rel) in allowed_pre:
-                posts[rel] = e.get("content_sha256")
+                posts[rel] = {"sha": e.get("content_sha256"), "mode": e.get("mode")}
 
     exempt = {_rel(root, p) for p in exemption_files}
     gate_effects = {_rel(root, p) for p in gate_effect_paths}
@@ -171,9 +171,15 @@ def attribute_changes(root: Path, events: list[dict], *, envelope: list[str],
                 attributed.append(path)
             else:
                 actual = _blob_sha256(root, path)
-                if actual != posts[path]:
+                actual_mode = _file_mode(root, path)
+                if actual != posts[path]["sha"]:
                     violations.append({"path": path, "reason": "blob sha mismatch",
-                                       "expected": posts[path], "actual": actual})
+                                       "expected": posts[path]["sha"], "actual": actual})
+                elif posts[path]["mode"] is not None \
+                        and actual_mode != posts[path]["mode"]:
+                    violations.append({"path": path, "reason": "mode changed after post",
+                                       "expected": posts[path]["mode"],
+                                       "actual": actual_mode})
                 else:
                     attributed.append(path)
         elif path in gate_effects and _in(path, gate_envelope):
@@ -184,6 +190,14 @@ def attribute_changes(root: Path, events: list[dict], *, envelope: list[str],
     if violations:
         raise Violation({"violations": violations})
     return {"attributed": attributed}
+
+
+def _file_mode(root: Path, path: str) -> str | None:
+    try:
+        import os
+        return oct((root / path).stat().st_mode & 0o777)
+    except OSError:
+        return None
 
 
 def _rel(root: Path, path: str) -> str:

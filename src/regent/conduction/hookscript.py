@@ -91,9 +91,19 @@ def _inside_envelope(path: str, envelope: list[str]) -> bool:
 
 def _decide(payload: dict) -> dict:
     tool_name = payload.get("tool_name", "")
-    tool_input = payload.get("tool_input", {}) or {}
+    tool_input = payload.get("tool_input")
     tool_use_id = payload.get("tool_use_id", "")
     envelope = json.loads(os.environ.get("REGENT_ENVELOPE", "[]"))
+
+    # Malformed payload → deny (fail closed), even for an allowlisted tool.
+    if not isinstance(tool_input, dict):
+        _append_event({"kind": "pre", "tool": tool_name or "<unknown>",
+                       "tool_use_id": tool_use_id, "paths": [],
+                       "decision": "deny", "reason": "malformed tool_input"})
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                       "permissionDecision": "deny",
+                                       "permissionDecisionReason":
+                                       "malformed tool_input (fail closed)"}}
 
     if tool_name in WRITE_TOOLS:
         targets = _target_paths(tool_name, tool_input)
@@ -123,16 +133,19 @@ def _decide(payload: dict) -> dict:
 
 def _post(payload: dict) -> dict:
     tool_name = payload.get("tool_name", "")
-    tool_input = payload.get("tool_input", {}) or {}
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return {}
     tool_use_id = payload.get("tool_use_id", "")
     for path in _target_paths(tool_name, tool_input):
         try:
             digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            mode = oct(os.stat(path).st_mode & 0o777)
         except OSError:
-            digest = None
+            digest, mode = None, None
         _append_event({"kind": "post", "tool": tool_name,
                        "tool_use_id": tool_use_id, "path": path,
-                       "content_sha256": digest})
+                       "content_sha256": digest, "mode": mode})
     return {}
 
 

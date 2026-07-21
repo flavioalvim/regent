@@ -141,15 +141,29 @@ class TurnTest(unittest.TestCase):
                 linkage="x", runner=_fake_claude_runner([]), service=self.service)
         self.assertEqual(ctx.exception.code, "STEP_MISMATCH")
 
-    def test_artifact_dir_must_be_under_regent(self):
+    def test_artifact_dir_must_be_canonical_build(self):
         self._start_build()
+        # a DIFFERENT dir under .regent must NOT be accepted (bypass closed)
+        alt = self.root / ".regent" / "elsewhere"
+        alt.mkdir(parents=True)
         with self.assertRaises(turnmod.TurnError) as ctx:
             turnmod.run_turn(
                 self.root, prompt_file=self.prompt, envelope=[str(self.work)],
                 gate_command="echo turn-gate-ok", declared_in=self.plan,
-                step="PLAN-004/STEP-09", artifact_dir=self.root / "outside",
+                step="PLAN-004/STEP-09", artifact_dir=alt,
                 linkage="x", runner=_fake_claude_runner([]), service=self.service)
         self.assertEqual(ctx.exception.code, "ARTIFACT_OUTSIDE_REGENT")
+
+    def test_recover_turn_reports_committed_step_and_partial(self):
+        self._start_build()
+        r = self._run(_fake_claude_runner([("work/out.txt", "hi", True)]))
+        self.assertEqual(r["outcome"], "TURN_OK")
+        rec = turnmod.recover_turn(self.root, linkage="PLAN-004/STEP-09",
+                                   step="PLAN-004/STEP-09", service=self.service)
+        self.assertEqual(rec["state"], "COMMITTED")
+        rec2 = turnmod.recover_turn(self.root, linkage="NOPE",
+                                    step="PLAN-004/STEP-09", service=self.service)
+        self.assertEqual(rec2["state"], "STEP_DONE")  # STEP file present
 
     def test_gate_red_no_product_commit(self):
         self._start_build()

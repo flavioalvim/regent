@@ -98,10 +98,12 @@ class AttributionTest(unittest.TestCase):
             _append_event({"kind": "pre", "tool": "Write",
                            "tool_use_id": tool_use_id, "paths": [str(path)],
                            "decision": "allow"})
+            import os as _os
             _append_event({"kind": "post", "tool": "Write",
                            "tool_use_id": tool_use_id, "path": str(path),
                            "content_sha256": hashlib.sha256(
-                               content.encode()).hexdigest()})
+                               content.encode()).hexdigest(),
+                           "mode": oct(_os.stat(path).st_mode & 0o777)})
         finally:
             for key in ("REGENT_EVENT_LOG", "REGENT_TURN_SECRET"):
                 os.environ.pop(key, None)
@@ -181,6 +183,14 @@ class AttributionTest(unittest.TestCase):
                 os.environ.pop(k, None)
         with self.assertRaises(Violation):
             self._attribute(envelope=["work"])
+
+    def test_mode_change_after_post_is_violation(self):
+        import os
+        self._write_and_post("work/exe.txt", "content")
+        os.chmod(self.work / "exe.txt", 0o755)  # bytes same, mode changed
+        with self.assertRaises(Violation) as ctx:
+            self._attribute(envelope=["work"])
+        self.assertIn("mode changed", str(ctx.exception.detail))
 
     def test_operational_exemptions_pass(self):
         control = self.root / ".regent" / "control.json"

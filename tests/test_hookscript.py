@@ -87,6 +87,24 @@ class HookTest(unittest.TestCase):
         out = self._pre("Read", str(self.root / "anything.txt"))
         self.assertEqual(out, {})  # no deny, no event required
 
+    def test_hook_denies_malformed_tool_input(self):
+        payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Read",
+                              "tool_input": "not-a-dict", "tool_use_id": "m1"})
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hookscript.main(["hook"], payload)
+        self.assertEqual(json.loads(buf.getvalue())["hookSpecificOutput"]
+                         ["permissionDecision"], "deny")
+
+    def test_post_records_mode(self):
+        target = self.envelope_dir / "m.txt"
+        self._pre("Write", str(target), tool_use_id="mm")
+        target.write_text("x", encoding="utf-8")
+        self._post("Write", str(target), tool_use_id="mm")
+        post = next(e for e in read_events(self.log) if e["kind"] == "post")
+        self.assertIsNotNone(post["mode"])
+
     def test_hook_error_fails_closed(self):
         del os.environ["REGENT_ENVELOPE"]  # force an internal error
         payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Write",
