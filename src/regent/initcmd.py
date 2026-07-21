@@ -179,10 +179,13 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
         failures = _rollback(created, replaced)
         try:
             journal.unlink()  # the rollback itself converged; marker done
-            if regent_dir_created:
-                (project_root / ".regent").rmdir()
         except OSError as cleanup_exc:
             failures.append(f"{journal} ({cleanup_exc})")
+        if regent_dir_created:
+            try:
+                (project_root / ".regent").rmdir()
+            except OSError as cleanup_exc:
+                failures.append(f"{project_root / '.regent'} ({cleanup_exc})")
         if failures:
             print(f"error: seeding failed ({exc}); rollback INCOMPLETE — "
                   f"unrestored: {failures}. Re-run init to converge "
