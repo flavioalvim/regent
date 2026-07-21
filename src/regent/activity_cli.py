@@ -25,6 +25,9 @@ _EXIT_BY_CODE = {
     "TOKEN_MISMATCH": 3, "LOCK_HELD": 3, "LOCK_SUSPECT": 3, "BUSY": 3,
     "CONFLICT": 3, "UNATTRIBUTABLE": 3, "CORRUPT_CONTROL": 4, "IO": 5,
     "ADVISOR_FAILED": 3, "ADVISOR_UNAVAILABLE": 2, "GATE_RED": 3, "PROVENANCE": 3,
+    "TURN_VIOLATION": 3, "TURN_TAMPERED": 3, "TURN_FAILED": 3, "NOT_ACTIVE": 2,
+    "STEP_MISMATCH": 2, "ARTIFACT_OUTSIDE_REGENT": 2, "STEP_ALREADY_DONE": 2,
+    "WORKTREE_DIRTY": 3,
 }
 
 
@@ -102,6 +105,22 @@ def build_parser(sub) -> None:
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--expect-verdict", default=None, dest="expect_verdict")
 
+    p_turn = sub.add_parser("turn", help="supervised confined production turn")
+    p_turn.add_argument("--project", default=None)
+    turn_sub = p_turn.add_subparsers(dest="turn_command", required=True)
+    p = turn_sub.add_parser("run")
+    p.add_argument("--prompt-file", required=True, dest="prompt_file")
+    p.add_argument("--envelope", action="append", required=True)
+    p.add_argument("--gate-envelope", action="append", default=[],
+                   dest="gate_envelope")
+    p.add_argument("--gate-command", required=True, dest="gate_command")
+    p.add_argument("--declared-in", required=True, dest="declared_in")
+    p.add_argument("--step", required=True)
+    p.add_argument("--artifact-dir", required=True, dest="artifact_dir")
+    p.add_argument("--linkage", required=True)
+    p.add_argument("--timeout", type=float, default=900.0)
+    p.add_argument("--claude-bin", default="claude", dest="claude_bin")
+
     p_gate = sub.add_parser("gate", help="mechanized gate execution")
     p_gate.add_argument("--project", default=None)
     gate_sub = p_gate.add_subparsers(dest="gate_command", required=True)
@@ -159,6 +178,31 @@ def run(args, out=None) -> int:
                               "exit_code": result["exit_code"],
                               "verdict": result["verdict"],
                               "artifact": result["artifact"]}, out)
+            return _emit(result, 0, out)
+        if args.command == "turn":
+            from .conduction.turn import TurnError, run_turn
+            from .conduction.gate import ProvenanceError
+            from .conduction.evidence import EvidenceConflict
+            try:
+                result = run_turn(
+                    root, prompt_file=Path(args.prompt_file),
+                    envelope=args.envelope, gate_envelope=args.gate_envelope,
+                    gate_command=args.gate_command,
+                    declared_in=Path(args.declared_in), step=args.step,
+                    artifact_dir=Path(args.artifact_dir), linkage=args.linkage,
+                    timeout=args.timeout, claude_bin=args.claude_bin)
+            except TurnError as exc:
+                return _fail(exc.code, exc.detail, out)
+            except ProvenanceError as exc:
+                return _fail("PROVENANCE", {"reason": str(exc)}, out)
+            except EvidenceConflict as exc:
+                return _fail("CONFLICT", {"paths": exc.paths}, out)
+            if not result["ok"]:
+                code = ({"TURN_VIOLATION": "TURN_VIOLATION",
+                         "TURN_TAMPERED": "TURN_TAMPERED",
+                         "GATE_RED": "GATE_RED"}.get(result["outcome"], "TURN_FAILED"))
+                return _fail(code, {"outcome": result["outcome"],
+                                    "artifact": result["artifact"]}, out)
             return _emit(result, 0, out)
         if args.command == "gate":
             from .conduction.gate import ProvenanceError, run_gate

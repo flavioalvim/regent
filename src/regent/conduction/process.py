@@ -25,10 +25,11 @@ class RunResult:
 
 
 class SubprocessRunner:
-    def run(self, argv: list[str], *, cwd: str, timeout: float) -> RunResult:
+    def run(self, argv: list[str], *, cwd: str, timeout: float,
+            env: dict | None = None) -> RunResult:
         proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
+                                stderr=subprocess.STDOUT, env=env,
                                 start_new_session=True)  # bytes mode + headless: NEVER
         # inherit the parent's stdin — a child waiting for EOF on an
         # inherited pipe hangs forever (caught live by the dogfooded review)
