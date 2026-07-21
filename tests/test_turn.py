@@ -193,40 +193,55 @@ class TurnTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "STOPPED")
         self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
 
-    def test_stop_before_commit_prevents_product_commit(self):
-        # A stop request that becomes visible only at the pre-commit boundary
-        # must suspend instead of committing the product.
+    def _stop_only_at_call(self, n):
+        """Wrap the service so stop_check returns True only on its Nth call —
+        lets a test place the stop AFTER the phase boundaries, at pre-commit."""
+        real = self.service.stop_check
+        state = {"i": 0}
+        def wrapped():
+            state["i"] += 1
+            if state["i"] >= n:
+                return {"stop_requested": True, "request": {"reason": "late"}}
+            return {"stop_requested": False, "request": None}
+        self.service.stop_check = wrapped
+        return real
+
+    def test_stop_at_pre_commit_suspends_turn_ok_no_commit(self):
+        # A stop visible only at the pre-commit boundary (after COMPOSED/LAUNCHED/
+        # GATED) must suspend a TURN_OK instead of committing the product.
         self._start_build()
-        class StopAfterGateRunner:
-            def __init__(self, service): self.service = service
-            def run(self, argv, *, cwd, timeout, env=None):
-                if argv and argv[0] == "bash":
-                    from regent.conduction.process import SubprocessRunner
-                    r = SubprocessRunner().run(argv, cwd=cwd, timeout=timeout, env=env)
-                    self.service.stop_request(reason="stop right after gate")
-                    return r
-                Path(cwd, "work").mkdir(exist_ok=True)
-                Path(cwd, "work/out.txt").write_text("hi", encoding="utf-8")
-                settings = json.loads(Path(argv[argv.index("--settings")+1]).read_text())
-                hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].split()
-                he = dict(os.environ, **(env or {}))
-                t = str(Path(cwd)/"work/out.txt")
-                subprocess.run(hook+["PreToolUse"], input=json.dumps(
-                    {"hook_event_name":"PreToolUse","tool_name":"Write",
-                     "tool_input":{"file_path":t},"tool_use_id":"s0"}),
-                    text=True, capture_output=True, env=he)
-                subprocess.run(hook+["PostToolUse"], input=json.dumps(
-                    {"hook_event_name":"PostToolUse","tool_name":"Write",
-                     "tool_input":{"file_path":t},"tool_use_id":"s0"}),
-                    text=True, capture_output=True, env=he)
-                return RunResult(0, b"", False)
+        self._stop_only_at_call(4)  # 1=COMPOSED 2=LAUNCHED 3=GATED 4=pre-commit
         with self.assertRaises(turnmod.TurnError) as ctx:
-            self._run(StopAfterGateRunner(self.service))
+            self._run(_fake_claude_runner([("work/out.txt", "hi", True)]))
         self.assertEqual(ctx.exception.code, "STOPPED")
+        self.assertEqual(ctx.exception.detail["phase"], "PRE_COMMIT")
         self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
         self.assertEqual(subprocess.run(
             ["git", "-C", str(self.root), "ls-files", "work/out.txt"],
-            capture_output=True, text=True).stdout.strip(), "")  # not committed
+            capture_output=True, text=True).stdout.strip(), "")
+
+    def test_stop_at_pre_commit_suspends_gate_red_no_operational_commit(self):
+        # Even a non-TURN_OK (GATE_RED) suspends at pre-commit; no operational
+        # evidence commit while a stop is pending.
+        self._start_build()
+        self.plan.write_text("### STEP-09\n- **Gate:** `exit 1`\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "red"], check=True)
+        head_before = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"],
+                                     capture_output=True, text=True).stdout.strip()
+        self._stop_only_at_call(4)
+        with self.assertRaises(turnmod.TurnError) as ctx:
+            turnmod.run_turn(
+                self.root, prompt_file=self.prompt, envelope=[str(self.work)],
+                gate_command="exit 1", declared_in=self.plan, step="PLAN-004/STEP-09",
+                artifact_dir=self.artdir, linkage="PLAN-004/STEP-09",
+                runner=_fake_claude_runner([("work/out.txt", "hi", True)]),
+                service=self.service)
+        self.assertEqual(ctx.exception.code, "STOPPED")
+        self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+        head_after = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"],
+                                    capture_output=True, text=True).stdout.strip()
+        self.assertEqual(head_before, head_after)  # no operational commit
 
     def test_recover_turn_reports_committed_step_and_partial(self):
         self._start_build()

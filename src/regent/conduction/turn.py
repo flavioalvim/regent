@@ -205,6 +205,7 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
         claude_exit = result.exit_code
         append_terminal_seal(turn.event_log, turn.secret)
         events = read_events(turn.event_log)
+        _boundary("LAUNCHED")  # honor a stop during launch on ANY exit
         pre_gate_changes = {p for _s, p in changed_paths(root)}
 
         if result.timed_out:
@@ -213,7 +214,6 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             outcome, detail = "FAILURE", f"claude exited {result.exit_code}"
         else:
             # -- GATED (keep-alive still running; heartbeat + stop check) --
-            _boundary("LAUNCHED")
             _set_phase(service, "GATED")
             from .evidence import EvidenceConflict
             gate_conflict = False
@@ -267,12 +267,13 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     turn.cleanup()
 
     # -- COMMITTED (supervisor only) --------------------------------------
-    # A stop that arrived during verify/attribute/evidence must still prevent
-    # the product commit. Only meaningful for a TURN_OK (others do not commit
-    # product anyway); a stopped TURN_OK suspends instead of committing.
-    if outcome == "TURN_OK" and service.stop_check()["stop_requested"]:
-        _stopped_suspend(service, token, "VERIFIED")
-        raise TurnError("STOPPED", {"phase": "VERIFIED"})
+    # A stop that arrived during verify/attribute/evidence (for ANY outcome)
+    # suspends instead of committing product OR operational evidence — the
+    # mediator resumes with /regent (the evidence artifact is on disk,
+    # uncommitted, and the worktree is left for inspection).
+    if service.stop_check()["stop_requested"]:
+        _stopped_suspend(service, token, "PRE_COMMIT")
+        raise TurnError("STOPPED", {"phase": "PRE_COMMIT", "outcome": outcome})
     _set_phase(service, "COMMITTING")
     if outcome == "TURN_OK":
         _write_step_file(step_file, step_name, attributed, base_sha, linkage,
