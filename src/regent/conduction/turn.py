@@ -62,8 +62,11 @@ def _current_step(plan_text: str, artifact_dir: Path) -> str | None:
 
 
 def _step_gate(plan_text: str, step_name: str) -> str | None:
-    """Extract the gate from THAT step's block (heading → next STEP heading)."""
-    m = re.search(rf"{re.escape(step_name)}\b(.*?)(?=STEP-\d+|\Z)", plan_text, re.S)
+    """Extract the gate from THAT step's block — bounded by the next step
+    HEADING line (^#+ ... STEP-NN), so a gate command that merely CONTAINS a
+    step name (e.g. a path work/STEP-01.out) is not truncated."""
+    m = re.search(rf"{re.escape(step_name)}\b(.*?)(?=\n#+[^\n]*STEP-\d+|\Z)",
+                  plan_text, re.S)
     if not m:
         return None
     g = re.search(r"\*\*Gate:\*\*\s*`([^`]+)`", m.group(1))
