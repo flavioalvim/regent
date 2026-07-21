@@ -163,9 +163,9 @@ class ActivityCliTest(unittest.TestCase):
 
 
 class VersionTest(unittest.TestCase):
-    def test_cli_version_reports_040(self):
+    def test_cli_version_reports_050(self):
         import regent
-        self.assertEqual(regent.__version__, "0.4.0")
+        self.assertEqual(regent.__version__, "0.5.0")
 
 
 if __name__ == "__main__":
