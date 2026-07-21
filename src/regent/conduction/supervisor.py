@@ -76,12 +76,14 @@ def _fsync_dir(path: Path) -> None:
 
 def _unlink_durable(path: Path) -> None:
     """Remove the token and fsync the directory so a crash after unlink cannot
-    resurrect it. A MISSING file is success; any OTHER failure PROPAGATES so the
-    caller never reports a removal that did not happen."""
+    resurrect it. The dir-fsync is the DURABILITY BARRIER and runs even when the
+    file is already gone (a prior unlink whose fsync had failed): removal is not
+    'done' until that fsync SUCCEEDS. Any fsync/unlink error other than a missing
+    file PROPAGATES, so a caller never reports a removal that isn't durable."""
     try:
         path.unlink()
     except FileNotFoundError:
-        return  # already gone == removed
+        pass  # already unlinked from the namespace — still fsync below
     _fsync_dir(path)  # OSError here propagates: durability is not assured
 
 
@@ -237,6 +239,13 @@ def disarm(service: ActivityService, *, arm_id: str | None = None) -> dict:
         with _arm_lock(service.state_dir):
             payload = _raw_arm(service.state_dir)
             if payload is None:
+                # The file may be gone from the namespace but from an unlink whose
+                # dir-fsync had failed — run the durability barrier before calling
+                # it "already gone", so we never claim a non-durable removal.
+                try:
+                    _unlink_durable(_arm_path(service.state_dir))
+                except OSError as exc:
+                    return {"disarmed": False, "reason": f"fsync failed: {exc}"}
                 return {"disarmed": False, "reason": "no arm token"}
             if arm_id is not None and payload.get("arm_id") != arm_id:
                 return {"disarmed": False, "reason": "arm_id mismatch (rearmed)"}

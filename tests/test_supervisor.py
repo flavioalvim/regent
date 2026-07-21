@@ -380,6 +380,41 @@ class SupervisorTest(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIsNotNone(sup._raw_arm(self.service.state_dir))  # still armed
 
+    def test_daemon_disarm_failed_when_dir_fsync_persistently_fails(self):
+        # advisor finding #1 (round 4): a dir-fsync failure (file already unlinked)
+        # must NOT be masked as benign "no arm token" — removal isn't durable, so
+        # the terminal is DISARM_FAILED.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        import regent.conduction.supervisor as mod
+        orig = mod._fsync_dir
+        mod._fsync_dir = lambda p: (_ for _ in ()).throw(OSError("fsync"))
+        try:
+            r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        finally:
+            mod._fsync_dir = orig
+        self.assertEqual(r["final_state"], "DISARM_FAILED")
+
+    def test_daemon_recovers_when_dir_fsync_succeeds_on_retry(self):
+        # a TRANSIENT fsync failure: attempt 1 unlinks but fsync fails; the retry
+        # re-runs the durability barrier and, on success, confirms removal.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        import regent.conduction.supervisor as mod
+        orig = mod._fsync_dir
+        calls = {"n": 0}
+
+        def flaky(p):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("transient")
+            return orig(p)
+        mod._fsync_dir = flaky
+        try:
+            r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        finally:
+            mod._fsync_dir = orig
+        self.assertEqual(r["final_state"], "STEPS_COMPLETE")
+        self.assertIsNone(sup._raw_arm(self.service.state_dir))  # durably gone
+
     def test_daemon_disarms_on_unexpected_failure(self):
         # advisor finding #4: a non-LoopError escaping run_loop must still disarm.
         sup.arm(self.service, plan_id="PLAN-006", config=self._config())
