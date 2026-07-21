@@ -189,6 +189,39 @@ class TurnAbortIntegrationTest(unittest.TestCase):
         self.assertEqual(self.service.lock.status()["state"], "free")
         self.assertFalse(list(self.service.state_dir.glob("abort.claimed-*")))
 
+    def test_recover_claimed_takes_precedence_over_trailer(self):
+        # Simulate crash after the ABORTED op-commit (trailer present) but before
+        # suspend: .claimed still present + activity ACTIVE → recover suspends,
+        # NOT COMMITTED.
+        activity = self.service.store.load()["activity"]
+        subprocess.run(["git", "-C", str(self.root), "commit", "--allow-empty",
+                        "-qm", "x\n\nRegent-Turn: PLAN-005/STEP-01/try1"], check=True)
+        claimed = self.service.state_dir / "abort.claimed-c1"
+        import json as _json
+        claimed.write_text(_json.dumps(
+            {"id": "c1", "activity_id": activity["id"],
+             "activity_epoch": activity["epoch"],
+             "turn_token": activity["turn"]["token"]}), encoding="utf-8")
+        rec = turnmod.recover_turn(self.root, linkage="PLAN-005/STEP-01/try1",
+                                   step="PLAN-005/STEP-01", service=self.service)
+        self.assertEqual(rec["state"], "ABORT_RECONCILED")
+        self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+
+    def test_recover_reconciles_suspended_via_owning_turn(self):
+        # After suspend, the token lives in suspension.owning_turn (turn=null).
+        token = self.service.store.load()["activity"]["turn"]["token"]
+        self.service.suspend(checkpoint="turn:LAUNCHED", reason="aborted")
+        claimed = self.service.state_dir / "abort.claimed-c2"
+        import json as _json
+        claimed.write_text(_json.dumps(
+            {"id": "c2", "activity_id": "PLAN-005", "activity_epoch":
+             self.service.store.load()["activity"]["epoch"], "turn_token": token}),
+            encoding="utf-8")
+        rec = turnmod.recover_turn(self.root, linkage="PLAN-005/STEP-01",
+                                   step="PLAN-005/STEP-01", service=self.service)
+        self.assertEqual(rec["state"], "ABORT_RECONCILED")  # bound via owning_turn
+        self.assertFalse(list(self.service.state_dir.glob("abort.claimed-*")))
+
     def test_recover_turn_unbound_marker_left_for_mediator(self):
         claimed = self.service.state_dir / f"abort.claimed-{'b'*8}"
         import json as _json

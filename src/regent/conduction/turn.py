@@ -107,43 +107,45 @@ def recover_turn(root: Path, *, linkage: str, step: str,
                  service: ActivityService | None = None) -> dict:
     """Recovery by inspection (PLAN-004): trailer → STEP file → worktree. Never
     resumes mid-agent; a partial turn leaves a dirty worktree for the mediator."""
+    import json as _json
+    from . import abort as _abort
     root = Path(root).resolve()
     service = service or ActivityService(root)
     plan_id, step_name = step.split("/", 1)
     step_file = root / ".regent" / "plans" / plan_id / "build" / f"{step_name}.md"
-    log = _git(root, "log", "--grep", f"Regent-Turn: {re.escape(linkage)}",
-               "--format=%H")
-    if log.strip():
-        return {"state": "COMMITTED", "commit": log.splitlines()[0]}
-    if step_file.exists():
-        return {"state": "STEP_DONE", "step_file": str(step_file)}
-    # An abort claimed but not reconciled (crash between claim and suspend):
-    # complete the suspension idempotently, but ONLY clear the marker once the
-    # activity is genuinely SUSPENDED and the lock released.
-    import json as _json
-    from . import abort as _abort
+
+    # An UNRECONCILED abort takes precedence over any trailer/STEP evidence (the
+    # ABORTED op-commit itself carries a Regent-Turn trailer, which must NOT be
+    # mistaken for a completed turn while the activity is still un-suspended).
     claimed = _abort.pending_claimed(service.state_dir)
     if claimed:
         control = service.store.load()
         activity = control.get("activity") or {}
-        # validate the claimed abort belongs to the CURRENT activity/epoch
+        state = activity.get("state")
+        # the fencing token: turn.token while ACTIVE, suspension.owning_turn once
+        # SUSPENDED (suspend sets turn=null and preserves the token there).
+        cur_token = ((activity.get("turn") or {}).get("token") if state == "ACTIVE"
+                     else (activity.get("suspension") or {}).get("owning_turn"))
         try:
             marker = _json.loads(claimed[0].read_text(encoding="utf-8"))
         except (OSError, ValueError):
             marker = {}
-        cur_token = (activity.get("turn") or {}).get("token")
         bound = (marker.get("activity_id") == activity.get("id")
                  and marker.get("activity_epoch") == activity.get("epoch")
-                 and marker.get("turn_token") == cur_token)  # token too (fencing)
-        if activity.get("state") == "SUSPENDED":
-            if bound and service.lock.status()["state"] == "free":
-                _abort.clear_claimed(service.state_dir)
+                 and marker.get("turn_token") == cur_token)
+        binding = dict(activity_id=marker.get("activity_id"),
+                       activity_epoch=marker.get("activity_epoch"),
+                       turn_token=marker.get("turn_token"))
+        if not bound:
+            return {"state": "ABORT_MARKER_UNBOUND", "action": "mediator must reconcile"}
+        if state == "SUSPENDED":
+            if service.lock.status()["state"] == "free":
+                _abort.clear_claimed(service.state_dir, **binding)
                 return {"state": "ABORT_RECONCILED",
                         "action": "already suspended; /regent resumes"}
-            # suspended but lock still held, or marker not bound: do NOT clear
-            return {"state": "ABORT_RECOVERY_INCOMPLETE" if bound
-                    else "ABORT_MARKER_UNBOUND", "action": "mediator must reconcile"}
-        if activity.get("state") == "ACTIVE" and bound:
+            return {"state": "ABORT_RECOVERY_INCOMPLETE",
+                    "action": "mediator must reconcile"}
+        if state == "ACTIVE":
             try:
                 service._suspend_locked(checkpoint="turn:ABORT_RECOVERY",
                                         reason="abort reconciled on recovery")
@@ -152,12 +154,18 @@ def recover_turn(root: Path, *, linkage: str, step: str,
                         "action": "mediator must reconcile"}
             if service.store.load()["activity"]["state"] == "SUSPENDED" \
                     and service.lock.status()["state"] == "free":
-                _abort.clear_claimed(service.state_dir)
+                _abort.clear_claimed(service.state_dir, **binding)
                 return {"state": "ABORT_RECONCILED", "action": "suspended; /regent resumes"}
             return {"state": "ABORT_RECOVERY_INCOMPLETE",
                     "action": "mediator must reconcile"}
-        # marker not bound to the current activity: leave for the mediator
         return {"state": "ABORT_MARKER_UNBOUND", "action": "mediator must reconcile"}
+
+    log = _git(root, "log", "--grep", f"Regent-Turn: {re.escape(linkage)}",
+               "--format=%H")
+    if log.strip():
+        return {"state": "COMMITTED", "commit": log.splitlines()[0]}
+    if step_file.exists():
+        return {"state": "STEP_DONE", "step_file": str(step_file)}
     if _dirty_non_exempt(root):
         return {"state": "PARTIAL", "action": "mediator must inspect/discard the "
                 "worktree; a mid-agent turn is never auto-resumed"}
