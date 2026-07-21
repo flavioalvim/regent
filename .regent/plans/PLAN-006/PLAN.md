@@ -1,4 +1,11 @@
-# PLAN-006 — Condução fase 4: ensaio, ativação e daemon supervisor
+# PLAN-006 (v2) — Condução fase 4:
+
+*v2 após ADVISOR-REVIEW-1 (6 objeções incorporadas — ver CLAUDE-REBUTTAL.md). Mudanças:
+arm-token com arm_id+token+config-do-loop (crash-safe, CAS por arm_id); guard por turno no
+run_loop (revalida o arm; DISARMED); arm com pré-condições duras; e COMPLETE do loop =
+STEPS_COMPLETE (a revisão final + CONCLUSION + conclude ficam com o MEDIADOR, não o daemon).*
+
+## Condução fase 4: ensaio, ativação e daemon supervisor
 
 ## Objetivo
 
@@ -30,33 +37,41 @@ próxima tentativa (tryK) de cada. Não exige atividade ACTIVE (é diagnóstico)
 bool}`; exit 0 sempre (é leitura). Erros de leitura/parse = `USAGE`/`CORRUPT`.
 
 ### Ativação (`regent arm`/`disarm`) — gate de segurança durável
-- `regent arm --plan PLAN-NNN [--max-turns N]` grava atomicamente (tmp+rename) o arm-token
-  no XDG (`arm.token`): `{plan_id, armed_at, max_turns, activity_epoch}`. Um arm-token
-  presente para outro plano = `ALREADY_ARMED` (desarme primeiro). Vincula ao epoch corrente
-  da atividade build (se houver) para não sobreviver a um ciclo.
-- `regent disarm` remove o arm-token (idempotente; sem token = no-op reportado).
-- O arm-token NUNCA sobrevive silenciosamente a uma troca de plano/epoch: leitura valida o
-  vínculo; obsoleto = ignorado + auditado.
-- Armar é do DONO (mediador). O daemon LÊ; nunca arma.
+- `regent arm --plan PLAN-NNN --prompt-template <p> --envelope <e> [--envelope ...]
+  [--gate-envelope ...] --declared-in <PLAN.md> --artifact-dir <build> [--max-turns N=20]
+  [--timeout 900]` grava o arm-token ATÔMICO (tmp+fsync+rename+fsync do dir) no XDG:
+  `{arm_id(uuid4), plan_id, activity_epoch, turn_token, armed_at, config:{prompt_template,
+  envelope, gate_envelope, declared_in, artifact_dir, max_turns, timeout}}`. **Pré-condições
+  DURAS:** exige atividade `build` ACTIVE cujo id == o plano, `APPROVAL.md` APPROVED, SEM
+  `build/CONCLUSION.md`, workspace verdict executável e token CORRENTE (vincula a esse
+  token). Sem atividade correspondente = erro (NUNCA autoriza atividade futura). Config
+  validada (paths canônicos, gate por step). Outro plano já armado = `ALREADY_ARMED`.
+- `regent disarm [--arm-id ID]` remove o arm-token por CAS de arm_id (um daemon antigo com
+  arm_id A NUNCA apaga um rearm B); sem --arm-id remove o corrente; idempotente.
+- Leitura do arm-token VALIDA arm_id+plan+epoch+token; obsoleto (takeover trocou o token, ou
+  epoch mudou) = ignorado + auditado (nunca sobrevive a um ciclo/takeover).
+- Armar é do DONO. O daemon LÊ; nunca arma.
 
 ### `regent daemon run` (foreground supervisor)
-`regent daemon run [--poll 5] [--claude-bin B] [--once]` — loop:
-- **Não age sem arm-token válido** para uma atividade `build` ACTIVE cujo plano == o armado,
-  APPROVED, epoch casando: sem isso → estado `IDLE` (aguarda; ou sai com `--once`).
-- Com condições satisfeitas: adquire o LOOP (herda o loop lock do PLAN-005 — o daemon é só
-  outro processo que chama run_loop), dirige o build via `run_loop` com o `max_turns`
-  armado. Ao retornar:
-  - `COMPLETE` → **DESARMA automaticamente** (o trabalho acabou; segurança) e reporta
-    `COMPLETED`.
-  - `STOPPED`/`ABORTED` → a atividade ficou SUSPENDED; o daemon **DESARMA** (exige nova
-    ordem do dono) e reporta a condição.
-  - `HALTED`/`MAX_TURNS`/`LOOP_*`/`PLAN_NOT_EXECUTABLE` → **DESARMA** e reporta (mediador
-    decide). Nunca re-tenta sozinho.
-- Entre ciclos, checa: desarme (arm-token sumiu) → para; stop-request pendente → honra e
-  para; SIGINT/SIGTERM → desarma e sai graciosamente (foreground).
-- `--once`: um ciclo e sai (útil para teste e para orquestração externa).
-- stdout: linha JSON por transição de estado (`IDLE`/`RUNNING`/`COMPLETED`/`HALTED`/...);
-  exit 0 se terminou em COMPLETED ou IDLE-por-desarme; ≠0 em condição de falha terminal.
+`regent daemon run [--poll 5] [--claude-bin B] [--once]` — LÊ toda a config do loop do
+arm-token (não recebe args de loop). Loop:
+- **Não age sem arm-token VÁLIDO** (arm_id+plan+epoch+token casando) para uma `build` ACTIVE
+  APPROVED, sem CONCLUSION.md, workspace executável: senão → `IDLE` (aguarda; ou sai `--once`).
+- Com condições satisfeitas: dirige o build via `run_loop` (config do arm), passando um
+  `guard` que REVALIDA o arm ANTES de cada turno (arm_id/plan/epoch/token/APPROVED/
+  não-concluído); guard falho (desarme, takeover, sinal) → o loop PARA com `DISARMED` (o
+  turno em voo termina ou é abortado pela via de abort; o guard só barra INICIAR o próximo).
+  Ao retornar:
+  - `COMPLETE` (nenhum STEP pendente) → **DESARMA** e reporta `STEPS_COMPLETE`. O daemon
+    NÃO faz a revisão final, NÃO cria CONCLUSION.md, NÃO conclui a atividade — isso é DECISÃO
+    MEDIADA do dono (/regent). "STEPs feitos" ≠ "build aceito".
+  - `STOPPED`/`ABORTED`/`DISARMED` → atividade SUSPENDED/parada; **DESARMA** e reporta.
+  - `HALTED`/`MAX_TURNS`/`LOOP_*`/`PLAN_NOT_EXECUTABLE` → **DESARMA** e reporta. Nunca
+    re-tenta sozinho.
+- Entre ciclos: desarme → para; stop-request → honra e para; SIGINT/SIGTERM → desarma e sai.
+- `--once`: um ciclo e sai.
+- stdout: linha JSON por transição (`IDLE`/`RUNNING`/`STEPS_COMPLETE`/`HALTED`/...); exit 0
+  se STEPS_COMPLETE ou IDLE-por-desarme; ≠0 em falha terminal.
 
 ### Segurança declarada (o cerne da fase 4)
 O daemon é AUTÔNOMO por turno mas NÃO por decisão de INICIAR: sem arm-token do dono, ele
@@ -78,7 +93,11 @@ falho. Arm-token vinculado ao epoch impede sobrevivência a um ciclo de atividad
   `test_daemon_disarms_after_complete`, `test_daemon_disarms_on_halted`,
   `test_daemon_disarms_on_stopped`, `test_daemon_stops_on_disarm_between_cycles`,
   `test_daemon_once_single_cycle`, `test_daemon_never_acts_on_unarmed_plan`,
-  `test_daemon_respects_stop_request`.
+  `test_daemon_respects_stop_request`, `test_daemon_reports_steps_complete_not_accepted`,
+  `test_daemon_guard_disarm_stops_between_turns`,
+  `test_arm_refuses_without_matching_active_build`,
+  `test_arm_token_stale_after_takeover_ignored`,
+  `test_disarm_cas_old_id_does_not_remove_rearm`.
 - **Gate:** `PYTHONPATH=src python3 -m unittest discover -s tests`
 
 ### STEP-03 — CLI `regent rehearse|arm|disarm|daemon`
