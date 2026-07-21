@@ -20,6 +20,30 @@ def _run(argv):
     return code, json.loads(text) if text else None
 
 
+# A real fake-claude: parses the prompt for the STEP, then writes
+# work/<step>.out THROUGH the confined hook (PreToolUse/PostToolUse) exactly as a
+# genuine agent would — so the turn's git-anchored attribution is satisfied.
+_FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import json, os, re, subprocess, sys
+argv = sys.argv
+prompt = argv[argv.index("-p") + 1]
+settings = json.loads(open(argv[argv.index("--settings") + 1]).read())
+hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].split()
+m = re.search(r"STEP-\d+", prompt)
+step = m.group(0) if m else "STEP-01"
+target = os.path.join(os.getcwd(), "work", step + ".out")
+for phase in ("PreToolUse", "PostToolUse"):
+    if phase == "PostToolUse":
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        open(target, "w").write("done")
+    subprocess.run(hook + [phase], input=json.dumps(
+        {"hook_event_name": phase, "tool_name": "Write",
+         "tool_input": {"file_path": target}, "tool_use_id": step}),
+        text=True, capture_output=True, env=os.environ.copy())
+sys.exit(0)
+'''
+
+
 class SupervisorCliTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -97,6 +121,29 @@ class SupervisorCliTest(unittest.TestCase):
         code, payload = _run(["daemon", "--project", str(self.root), "run", "--once"])
         self.assertEqual(code, 2)
         self.assertEqual(payload["final_state"], "STOPPED")
+
+    def test_e2e_arm_daemon_drives_two_steps_to_complete(self):
+        # STEP-04 e2e: a REAL fake-claude, driven through the CLI end to end.
+        fake = Path(self._tmp.name) / "fake-claude.py"
+        fake.write_text(_FAKE_CLAUDE, encoding="utf-8")
+        fake.chmod(0o755)
+        code, armed = _run(self._arm_argv())
+        self.assertEqual(code, 0)
+        code, payload = _run(["daemon", "--project", str(self.root), "run",
+                              "--once", "--claude-bin", str(fake)])
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["final_state"], "STEPS_COMPLETE")
+        self.assertEqual(payload["turns"], 2)
+        # both steps really committed with their trailers
+        log = subprocess.run(["git", "-C", str(self.root), "log", "--format=%B"],
+                             capture_output=True, text=True).stdout
+        self.assertIn("Regent-Step: PLAN-006/STEP-01", log)
+        self.assertIn("Regent-Step: PLAN-006/STEP-02", log)
+        # disarmed after the terminal condition
+        from regent.conduction import supervisor as sup
+        self.assertIsNone(sup.read_arm(self.service))
+        # and the daemon did NOT conclude the activity (mediated)
+        self.assertEqual(self.service.store.load()["activity"]["state"], "ACTIVE")
 
 
 if __name__ == "__main__":

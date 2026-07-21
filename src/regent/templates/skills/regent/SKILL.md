@@ -7,8 +7,11 @@ description: Start or resume the regent activity in this repo — brainstorm (ad
 
 > **Capability level: v1 (control-backed).** Activity STATE lives in
 > `.regent/control.json` (transactional CAS + executor turn lock), driven through the
-> `regent` CLI; content artifacts (round/plan files) stay on disk. Still absent (future
-> phases): conduction daemon, confined execution, real `--abort`. Do not claim them.
+> `regent` CLI; content artifacts (round/plan files) stay on disk. Conduction is complete:
+> confined execution (`turn`), the turn loop with real `--abort` (`loop`), and the
+> foreground supervisor daemon with the durable arm/disarm safety gate (`rehearse`/`arm`/
+> `disarm`/`daemon`) all ship. Still future (phase 5): a BACKGROUND-detached daemon,
+> automatic arming, and notifications — do not claim those.
 
 ## 0. Read the state — `regent status`
 
@@ -67,11 +70,23 @@ executable gate) → advisor review (+1 rebuttal cycle) → `APPROVAL.md`
 (`status: APPROVED|REJECTED|CANCELLED` + actor) → `regent activity conclude --status
 <approval status>` + operational commit.
 
-**Build** — three ways. **Whole plan (preferred, hands-off):** `regent loop run --plan
-PLAN-NNN --prompt-template <task-template with {step}/{gate}> --envelope <path>
---declared-in <PLAN.md> --artifact-dir <build dir> [--max-turns N]` chains confined turns
-until COMPLETE / HALTED / STOPPED / ABORTED / MAX_TURNS; `regent loop abort --reason R`
-cancels the in-flight turn (suspends, resume with /regent). **One step (confined):**
+**Build** — four ways. **Supervised hands-off (preferred):** rehearse, then arm, then run
+the daemon. `regent rehearse --plan PLAN-NNN --declared-in <PLAN.md>` previews the pending
+steps + their gates WITHOUT touching the repo or launching an agent — read it before
+committing to a run. `regent arm --plan PLAN-NNN --prompt-template <template with
+{step}/{gate}> --envelope <path> [--envelope ...] [--gate-envelope ...] --declared-in
+<PLAN.md> --artifact-dir <build dir> [--max-turns N]` writes the durable, activity-bound
+arm-token — the OWNER's explicit authorization; the daemon never starts work without it.
+`regent daemon run [--once]` then drives the armed build via the loop, revalidating the arm
+before every turn, and DISARMS on every terminal condition. A loop COMPLETE is reported as
+`STEPS_COMPLETE` — the daemon does NOT run the final advisor review, write CONCLUSION.md, or
+conclude the activity: that stays a MEDIATED decision (come back to /regent for it). Disarm
+anytime with `regent disarm [--arm-id ID]`; stop with the stop channel; SIGINT/SIGTERM
+disarm and exit. **Whole plan (direct loop):** `regent loop run --plan PLAN-NNN
+--prompt-template <task-template with {step}/{gate}> --envelope <path> --declared-in
+<PLAN.md> --artifact-dir <build dir> [--max-turns N]` chains confined turns until COMPLETE /
+HALTED / STOPPED / ABORTED / MAX_TURNS; `regent loop abort --reason R` cancels the in-flight
+turn (suspends, resume with /regent). **One step (confined):**
 `regent turn run --prompt-file <task> --envelope <path> [--envelope ...]
 --gate-command "<step gate>" --declared-in <PLAN.md> --step PLAN-NNN/STEP-NN
 --artifact-dir <build dir under .regent> --linkage PLAN-NNN/STEP-NN` — launches a confined
