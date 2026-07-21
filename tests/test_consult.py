@@ -28,7 +28,7 @@ class FakeRunner:
         if not self.timed_out and self.message is not None:
             Path(msg_file).write_text(self.message, encoding="utf-8")
         return RunResult(None if self.timed_out else self.exit_code,
-                         self.raw_output, self.timed_out)
+                         self.raw_output.encode("utf-8"), self.timed_out)
 
 
 class ConsultTest(unittest.TestCase):

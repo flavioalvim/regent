@@ -156,6 +156,7 @@ def run(args, out=None) -> int:
             if not result["ok"]:
                 return _fail("ADVISOR_FAILED",
                              {"outcome": result["outcome"],
+                              "exit_code": result["exit_code"],
                               "verdict": result["verdict"],
                               "artifact": result["artifact"]}, out)
             return _emit(result, 0, out)

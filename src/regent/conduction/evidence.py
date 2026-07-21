@@ -23,20 +23,32 @@ class EvidenceConflict(Exception):
         self.paths = paths
 
 
-def atomic_write(path: Path, content: str) -> None:
+def atomic_write(path: Path, content: "str | bytes") -> None:
+    """Atomic NO-CLOBBER publish: os.link fails with EEXIST if the target
+    appeared meanwhile (closes the precheck→publish TOCTOU — evidence is never
+    overwritten, not even by a concurrent writer)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    payload = content.encode("utf-8") if isinstance(content, str) else content
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-    except OSError:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        os.link(tmp, path)  # atomic no-clobber (EEXIST if raced)
+    except OSError as exc:
+        import errno as _errno
+        if exc.errno == _errno.EEXIST:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise EvidenceConflict([str(path)]) from None
         try:
             tmp.unlink()
         except OSError:
             pass
         raise
-    os.replace(tmp, path)
+    tmp.unlink()
 
 
 class EvidenceSet:
@@ -51,7 +63,7 @@ class EvidenceSet:
         if existing:
             raise EvidenceConflict(existing)
 
-    def write_sibling(self, key: str, content: str) -> Path:
+    def write_sibling(self, key: str, content: "str | bytes") -> Path:
         path = self.siblings[key]
         try:
             atomic_write(path, content)

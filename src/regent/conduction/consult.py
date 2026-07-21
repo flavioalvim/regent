@@ -28,7 +28,9 @@ def run_consult(root: Path, *, prompt_file: Path, artifact: Path, linkage: str,
                 timeout: float = 600.0, expect_verdict: str | None = None,
                 runner=None, codex_bin: str = "codex") -> dict:
     root = Path(root)
-    prompt_text = Path(prompt_file).read_text(encoding="utf-8")
+    prompt_bytes = Path(prompt_file).read_bytes()  # byte-faithful (no newline
+    # translation — read_text would normalize CRLF)
+    prompt_text = prompt_bytes.decode("utf-8", errors="replace")
     evidence = EvidenceSet(Path(artifact),
                            {"prompt": Path(str(artifact) + "-PROMPT.md")})
     evidence.precheck()
@@ -38,7 +40,7 @@ def run_consult(root: Path, *, prompt_file: Path, artifact: Path, linkage: str,
             raise AdvisorUnavailable(f"'{codex_bin}' not found on PATH")
         runner = SubprocessRunner()
 
-    evidence.write_sibling("prompt", prompt_text)  # byte-identical copy first
+    evidence.write_sibling("prompt", prompt_bytes)  # byte-identical copy first
 
     fd, msg_file = tempfile.mkstemp(prefix="regent-consult-", suffix=".txt")
     os.close(fd)
@@ -48,9 +50,13 @@ def run_consult(root: Path, *, prompt_file: Path, artifact: Path, linkage: str,
                 "exec", "--cd", str(root), "-o", msg_file, prompt_text]
         result = runner.run(argv, cwd=str(root), timeout=timeout)
         try:
-            last_message = Path(msg_file).read_text(encoding="utf-8")
+            last_message = Path(msg_file).read_text(encoding="utf-8",
+                                                    errors="replace")
         except OSError:
             last_message = ""
+    except BaseException:
+        evidence.cleanup_orphans()  # non-terminal: never leave half a pair
+        raise
     finally:
         try:
             os.unlink(msg_file)
@@ -65,13 +71,15 @@ def run_consult(root: Path, *, prompt_file: Path, artifact: Path, linkage: str,
         outcome = "SUCCESS"
 
     body = last_message if last_message.strip() else result.output
-    verdict = _extract_verdict(body, expect_verdict or DEFAULT_VERDICT_RE)
+    pattern = expect_verdict if expect_verdict is not None else DEFAULT_VERDICT_RE
+    verdict = _extract_verdict(body, pattern)
     evidence.write_main(header(outcome, result.exit_code, linkage,
                                verdict=verdict), body)
 
     verdict_ok = verdict is not None if expect_verdict is not None else True
     return {"ok": outcome == "SUCCESS" and verdict_ok, "outcome": outcome,
-            "verdict": verdict, "artifact": str(evidence.main),
+            "verdict": verdict, "exit_code": result.exit_code,
+            "artifact": str(evidence.main),
             "prompt_copy": str(evidence.siblings["prompt"])}
 
 

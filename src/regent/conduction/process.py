@@ -16,25 +16,29 @@ from dataclasses import dataclass
 @dataclass
 class RunResult:
     exit_code: int | None
-    output: str
+    output_bytes: bytes
     timed_out: bool
+
+    @property
+    def output(self) -> str:
+        return self.output_bytes.decode("utf-8", errors="replace")
 
 
 class SubprocessRunner:
     def run(self, argv: list[str], *, cwd: str, timeout: float) -> RunResult:
         proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
-                                start_new_session=True)  # headless: NEVER
+                                stderr=subprocess.STDOUT,
+                                start_new_session=True)  # bytes mode + headless: NEVER
         # inherit the parent's stdin — a child waiting for EOF on an
         # inherited pipe hangs forever (caught live by the dogfooded review)
         try:
             output, _ = proc.communicate(timeout=timeout)
-            return RunResult(proc.returncode, output or "", False)
+            return RunResult(proc.returncode, output or b"", False)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
             output, _ = proc.communicate()
-            return RunResult(None, output or "", True)
+            return RunResult(None, output or b"", True)

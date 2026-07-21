@@ -24,7 +24,10 @@ class ProvenanceError(Exception):
 def run_gate(root: Path, *, command: str, declared_in: Path, artifact: Path,
              linkage: str, timeout: float = 1800.0, runner=None) -> dict:
     root = Path(root)
-    declared_text = Path(declared_in).read_text(encoding="utf-8")
+    if not command.strip():
+        raise ProvenanceError("empty gate command is never declared")
+    declared_text = Path(declared_in).read_text(encoding="utf-8",
+                                                errors="replace")
     if command not in declared_text:
         raise ProvenanceError(
             f"gate command not declared verbatim in {declared_in}")
@@ -35,9 +38,14 @@ def run_gate(root: Path, *, command: str, declared_in: Path, artifact: Path,
     if runner is None:
         runner = SubprocessRunner()
 
-    result = runner.run(["bash", "-c", command], cwd=str(root), timeout=timeout)
-    output = result.output
-    output_bytes = len(output.encode("utf-8"))
+    try:
+        result = runner.run(["bash", "-c", command], cwd=str(root),
+                            timeout=timeout)
+    except BaseException:
+        evidence.cleanup_orphans()
+        raise
+    raw = result.output_bytes
+    output_bytes = len(raw)
     truncated = output_bytes > TAIL_LIMIT
 
     if result.timed_out:
@@ -48,12 +56,12 @@ def run_gate(root: Path, *, command: str, declared_in: Path, artifact: Path,
         outcome = "RED"
 
     if truncated:
-        evidence.write_sibling("full", output)  # integral output first
+        evidence.write_sibling("full", raw)  # integral RAW BYTES first
+        tail = raw[-TAIL_LIMIT:].decode("utf-8", errors="replace")
         body = (f"[truncated: full output is {output_bytes} bytes — see "
-                f"{evidence.siblings['full'].name}; tail follows]\n"
-                + output[-TAIL_LIMIT:])
+                f"{evidence.siblings['full'].name}; tail follows]\n" + tail)
     else:
-        body = output
+        body = raw.decode("utf-8", errors="replace")
     evidence.write_main(header(outcome, result.exit_code, linkage,
                                command=command, output_bytes=output_bytes,
                                truncated=truncated), body)
