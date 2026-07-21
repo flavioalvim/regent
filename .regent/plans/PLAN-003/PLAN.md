@@ -1,4 +1,12 @@
-# PLAN-003 — Condução fase 1: advisor consult e gate run mecanizados
+# PLAN-003 (v2) — Condução fase 1: advisor consult e gate run mecanizados
+
+*v2 após ADVISOR-REVIEW-1 (5 objeções incorporadas — ver CLAUDE-REBUTTAL.md): proveniência
+obrigatória do comando de gate (--declared-in + verbatim, erro PROVENANCE); --expect-verdict
+explícito é fail-closed (ADVISOR_FAILED sem casamento); íntegra sempre preservada
+(<artifact>-FULL.log acima de 200 KiB); timeout mata o GRUPO de processos
+(start_new_session + killpg, com teste real de filho órfão); o PAR de artefatos tem
+contrato atômico único (pré-existência de qualquer um = CONFLICT; todo desfecho terminal
+deixa o par completo).*
 
 ## Objetivo
 
@@ -40,8 +48,9 @@ HMAC), `--abort` real, decisão automática de turno, ensaio; publicação PyPI.
   `{"error": "ADVISOR_UNAVAILABLE"}` exit 2 (código novo declarado).
 
 ### `regent gate run`
-`regent gate run --command "<shell>" --artifact <path-out> --linkage <str>
-[--timeout <s=1800>]`
+`regent gate run --command "<shell>" --declared-in <plan-artifact> --artifact <path-out>
+--linkage <str> [--timeout <s=1800>]` — o comando DEVE constar verbatim no artefato
+referenciado (senão erro `PROVENANCE`, código novo declarado)
 - Executa via `bash -c` no root do host; captura stdout+stderr combinados (cauda de até
   200 KiB no artefato, tamanho integral registrado) e exit code.
 - SEMPRE persiste o artefato com cabeçalho (`outcome: GREEN|RED|TIMEOUT`, `exit_code`,
@@ -65,6 +74,8 @@ valida o wiring ponta a ponta sem rede.
 
 ### STEP-01 — `conduction/consult.py` + subcomando
 - **Testes:** `test_consult_success_persists_tuple_and_verdict`,
+  `test_consult_expect_verdict_fail_closed`, `test_consult_pair_conflict_either_file`,
+  `test_consult_terminal_outcome_always_completes_pair`,
   `test_consult_timeout_records_and_fails_closed`,
   `test_consult_failure_records_exit_code`, `test_consult_refuses_existing_artifact`,
   `test_consult_missing_codex_is_capability_error`,
@@ -73,7 +84,9 @@ valida o wiring ponta a ponta sem rede.
 - **Gate:** `PYTHONPATH=src python3 -m unittest discover -s tests`
 
 ### STEP-02 — `conduction/gate.py` + subcomando
-- **Testes:** `test_gate_green_persists_and_exits_zero`,
+- **Testes:** `test_gate_green_persists_and_exits_zero`, `test_gate_provenance_required`,
+  `test_gate_timeout_kills_process_group` (filho sleep real morto),
+  `test_full_log_sidecar_over_200k`,
   `test_gate_red_fails_closed_with_artifact`, `test_gate_timeout_recorded`,
   `test_gate_refuses_existing_artifact`, `test_gate_output_tail_truncation_declared`.
 - **Gate:** `PYTHONPATH=src python3 -m unittest discover -s tests`
