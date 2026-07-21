@@ -1,0 +1,5 @@
+# PLAN-006 — build BASELINE
+
+base_sha: 56592563811c18b87cf8473c8726a2ab4b76ce7a
+plan: PLAN-006 (v2, APPROVED)
+started_at: 2026-07-21T09:43:25Z
