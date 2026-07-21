@@ -90,13 +90,16 @@ def _set_phase(service: ActivityService, phase: str) -> None:
 
 def _stopped_suspend(service, token, phase) -> None:
     """A stop request mid-turn suspends the activity canonically (the mediator
-    resumes with /regent). Best-effort: a lost token surfaces as its own error."""
+    resumes with /regent). Never swallowed: if the token was taken over, the
+    activity is no longer ours to suspend and the caller gets a CONFLICT."""
+    from ..protocol.stop import suspend_activity
+    from ..protocol.control import NotLockOwner as _NLO
     try:
-        from ..protocol.stop import suspend_activity
         suspend_activity(service.store, turn_token=token,
                          checkpoint=f"turn:{phase}", reason="stop requested mid-turn")
-    except Exception:  # noqa: BLE001
-        pass
+    except _NLO:
+        raise TurnError("CONFLICT", {"reason": "token diverged; cannot suspend "
+                                     "(taken over?) — mediator must reconcile"})
 
 
 def recover_turn(root: Path, *, linkage: str, step: str,
@@ -185,11 +188,14 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     stop = threading.Event()
     beat = threading.Thread(target=_keepalive, args=(service, token, stop), daemon=True)
     beat.start()
-    try:
+    def _boundary(phase: str) -> None:
         service.heartbeat()
         if service.stop_check()["stop_requested"]:
-            _stopped_suspend(service, token, "COMPOSED")
-            raise TurnError("STOPPED", {"phase": "COMPOSED"})
+            _stopped_suspend(service, token, phase)
+            raise TurnError("STOPPED", {"phase": phase})
+
+    try:
+        _boundary("COMPOSED")
         # -- LAUNCHED -----------------------------------------------------
         _set_phase(service, "LAUNCHED")
         prompt = Path(prompt_file).read_text(encoding="utf-8")
@@ -207,11 +213,8 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             outcome, detail = "FAILURE", f"claude exited {result.exit_code}"
         else:
             # -- GATED (keep-alive still running; heartbeat + stop check) --
+            _boundary("LAUNCHED")
             _set_phase(service, "GATED")
-            service.heartbeat()
-            if service.stop_check()["stop_requested"]:
-                _stopped_suspend(service, token, "LAUNCHED")
-                raise TurnError("STOPPED", {"phase": "LAUNCHED"})
             from .evidence import EvidenceConflict
             gate_conflict = False
             try:
@@ -229,11 +232,9 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             gate_effects = [str(root / p) for _s, p in changed_paths(root)
                             if p not in pre_gate_changes]
 
-            # -- VERIFIED -------------------------------------------------
+            # -- VERIFIED (stop check BEFORE the checkpoint) --------------
+            _boundary("GATED")
             _set_phase(service, "VERIFIED")
-            if service.stop_check()["stop_requested"]:
-                _stopped_suspend(service, token, "GATED")
-                raise TurnError("STOPPED", {"phase": "GATED"})
             exemption_files = EXEMPTIONS + [
                 str(artifact.relative_to(root)), str(step_file.relative_to(root))]
             if not gate_conflict:  # only exempt supervisor-written gate evidence
@@ -266,6 +267,12 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     turn.cleanup()
 
     # -- COMMITTED (supervisor only) --------------------------------------
+    # A stop that arrived during verify/attribute/evidence must still prevent
+    # the product commit. Only meaningful for a TURN_OK (others do not commit
+    # product anyway); a stopped TURN_OK suspends instead of committing.
+    if outcome == "TURN_OK" and service.stop_check()["stop_requested"]:
+        _stopped_suspend(service, token, "VERIFIED")
+        raise TurnError("STOPPED", {"phase": "VERIFIED"})
     _set_phase(service, "COMMITTING")
     if outcome == "TURN_OK":
         _write_step_file(step_file, step_name, attributed, base_sha, linkage,

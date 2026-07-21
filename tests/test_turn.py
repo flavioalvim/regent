@@ -177,7 +177,7 @@ class TurnTest(unittest.TestCase):
                 gate.write_text("forged gate evidence", encoding="utf-8")
                 return RunResult(0, b"", False)
         result = self._run(PoisonRunner())
-        self.assertIn(result["outcome"], ("TURN_VIOLATION", "GATE_RED"))
+        self.assertEqual(result["outcome"], "TURN_VIOLATION")
         self.assertFalse(result["ok"])
         # the forged gate file is NOT committed
         self.assertEqual(subprocess.run(
@@ -192,6 +192,41 @@ class TurnTest(unittest.TestCase):
             self._run(_fake_claude_runner([("work/out.txt", "hi", True)]))
         self.assertEqual(ctx.exception.code, "STOPPED")
         self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+
+    def test_stop_before_commit_prevents_product_commit(self):
+        # A stop request that becomes visible only at the pre-commit boundary
+        # must suspend instead of committing the product.
+        self._start_build()
+        class StopAfterGateRunner:
+            def __init__(self, service): self.service = service
+            def run(self, argv, *, cwd, timeout, env=None):
+                if argv and argv[0] == "bash":
+                    from regent.conduction.process import SubprocessRunner
+                    r = SubprocessRunner().run(argv, cwd=cwd, timeout=timeout, env=env)
+                    self.service.stop_request(reason="stop right after gate")
+                    return r
+                Path(cwd, "work").mkdir(exist_ok=True)
+                Path(cwd, "work/out.txt").write_text("hi", encoding="utf-8")
+                settings = json.loads(Path(argv[argv.index("--settings")+1]).read_text())
+                hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].split()
+                he = dict(os.environ, **(env or {}))
+                t = str(Path(cwd)/"work/out.txt")
+                subprocess.run(hook+["PreToolUse"], input=json.dumps(
+                    {"hook_event_name":"PreToolUse","tool_name":"Write",
+                     "tool_input":{"file_path":t},"tool_use_id":"s0"}),
+                    text=True, capture_output=True, env=he)
+                subprocess.run(hook+["PostToolUse"], input=json.dumps(
+                    {"hook_event_name":"PostToolUse","tool_name":"Write",
+                     "tool_input":{"file_path":t},"tool_use_id":"s0"}),
+                    text=True, capture_output=True, env=he)
+                return RunResult(0, b"", False)
+        with self.assertRaises(turnmod.TurnError) as ctx:
+            self._run(StopAfterGateRunner(self.service))
+        self.assertEqual(ctx.exception.code, "STOPPED")
+        self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root), "ls-files", "work/out.txt"],
+            capture_output=True, text=True).stdout.strip(), "")  # not committed
 
     def test_recover_turn_reports_committed_step_and_partial(self):
         self._start_build()
