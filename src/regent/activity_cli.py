@@ -31,6 +31,18 @@ _EXIT_BY_CODE = {
     "LOOP_HALTED": 3, "LOOP_ABORTED": 3, "LOOP_MAX_TURNS": 3, "LOOP_STOPPED": 2,
     "LOOP_BUSY": 3, "PLAN_NOT_EXECUTABLE": 2, "LOOP_CONFLICT": 3, "LOOP_DIRTY": 3,
     "LOOP_MISCONFIGURED": 2, "ABORT_PENDING": 3,
+    "NOT_EXECUTABLE": 2, "ALREADY_ARMED": 2, "ALREADY_CONCLUDED": 2,
+    "DISARMED": 2, "STEPS_COMPLETE": 0, "IDLE": 0, "SIGNALLED": 0, "STOPPED": 2,
+    "DAEMON_HALTED": 3,
+}
+
+# Daemon terminal states → exit code. OK states exit 0; owner-initiated stops
+# exit 2; failure conditions exit 3 (reuse the loop codes where they exist).
+_DAEMON_EXIT = {
+    "STEPS_COMPLETE": 0, "IDLE": 0, "SIGNALLED": 0,
+    "STOPPED": 2, "DISARMED": 2, "PLAN_NOT_EXECUTABLE": 2, "LOOP_MISCONFIGURED": 2,
+    "HALTED": 3, "ABORTED": 3, "MAX_TURNS": 3, "LOOP_CONFLICT": 3, "LOOP_DIRTY": 3,
+    "LOOP_BUSY": 3, "USAGE": 64,
 }
 
 
@@ -157,6 +169,36 @@ def build_parser(sub) -> None:
     p = control_sub.add_parser("explain")
     p.add_argument("--since-version", type=int, default=None, dest="since_version")
 
+    p_rehearse = sub.add_parser("rehearse",
+                                help="preview pending steps+gates (read-only)")
+    p_rehearse.add_argument("--project", default=None)
+    p_rehearse.add_argument("--plan", required=True)
+    p_rehearse.add_argument("--declared-in", required=True, dest="declared_in")
+
+    p_arm = sub.add_parser("arm", help="durable arm-token authorizing the daemon")
+    p_arm.add_argument("--project", default=None)
+    p_arm.add_argument("--plan", required=True)
+    p_arm.add_argument("--prompt-template", required=True, dest="prompt_template")
+    p_arm.add_argument("--envelope", action="append", required=True)
+    p_arm.add_argument("--gate-envelope", action="append", default=[],
+                       dest="gate_envelope")
+    p_arm.add_argument("--declared-in", required=True, dest="declared_in")
+    p_arm.add_argument("--artifact-dir", required=True, dest="artifact_dir")
+    p_arm.add_argument("--max-turns", type=int, default=20, dest="max_turns")
+    p_arm.add_argument("--timeout", type=float, default=900.0)
+
+    p_disarm = sub.add_parser("disarm", help="remove the arm-token (CAS by arm-id)")
+    p_disarm.add_argument("--project", default=None)
+    p_disarm.add_argument("--arm-id", default=None, dest="arm_id")
+
+    p_daemon = sub.add_parser("daemon", help="foreground supervisor over an armed plan")
+    p_daemon.add_argument("--project", default=None)
+    daemon_sub = p_daemon.add_subparsers(dest="daemon_command", required=True)
+    p = daemon_sub.add_parser("run")
+    p.add_argument("--poll", type=float, default=5.0)
+    p.add_argument("--claude-bin", default="claude", dest="claude_bin")
+    p.add_argument("--once", action="store_true")
+
 
 def run(args, out=None) -> int:
     root = find_root(Path.cwd(), getattr(args, "project", None))
@@ -275,6 +317,30 @@ def run(args, out=None) -> int:
                                           "exit_code": result["exit_code"],
                                           "artifact": result["artifact"]}, out)
             return _emit(result, 0, out)
+        if args.command in ("rehearse", "arm", "disarm", "daemon"):
+            from .conduction import supervisor as sup
+            if args.command == "rehearse":
+                report = sup.rehearse(root, plan_id=args.plan,
+                                      declared_in=Path(args.declared_in))
+                return _emit(report, 0, out)  # read-only; always exit 0
+            if args.command == "arm":
+                config = {"prompt_template": args.prompt_template,
+                          "envelope": args.envelope, "gate_envelope": args.gate_envelope,
+                          "declared_in": args.declared_in,
+                          "artifact_dir": args.artifact_dir,
+                          "max_turns": args.max_turns, "timeout": args.timeout}
+                try:
+                    payload = sup.arm(service, plan_id=args.plan, config=config)
+                except sup.SupervisorError as exc:
+                    return _fail(exc.code, exc.detail, out)
+                return _emit({"ok": True, **payload}, 0, out)
+            if args.command == "disarm":
+                return _emit(sup.disarm(service, arm_id=args.arm_id), 0, out)
+            # daemon run
+            result = sup.run_daemon(service, poll=args.poll,
+                                    claude_bin=args.claude_bin, once=args.once)
+            code = _DAEMON_EXIT.get(result["final_state"], 3)
+            return _emit(result, code, out)
         return _fail("USAGE", f"unknown command {args.command!r}", out)
     except ActivityError as exc:
         return _fail(exc.code, exc.detail, out)
