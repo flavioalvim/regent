@@ -91,7 +91,7 @@ def _git(root: Path, *argv: str) -> str:
 
 def changed_paths(root: Path) -> list[tuple[str, str]]:
     """[(xy_status, path)] from porcelain, handling renames as del+add."""
-    out = _git(root, "status", "--porcelain", "-z")
+    out = _git(root, "status", "--porcelain", "-z", "-uall")
     entries, parts = [], out.split("\0")
     i = 0
     while i < len(parts):
