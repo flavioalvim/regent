@@ -22,7 +22,7 @@ class ProvenanceError(Exception):
 
 
 def run_gate(root: Path, *, command: str, declared_in: Path, artifact: Path,
-             linkage: str, timeout: float = 1800.0, runner=None) -> dict:
+             linkage: str, timeout: float = 1800.0, runner=None, cancel=None) -> dict:
     root = Path(root)
     if not command.strip():
         raise ProvenanceError("empty gate command is never declared")
@@ -41,7 +41,7 @@ def run_gate(root: Path, *, command: str, declared_in: Path, artifact: Path,
     # ONE cleanup guard around execution + both publishes (see consult.py).
     try:
         result = runner.run(["bash", "-c", command], cwd=str(root),
-                            timeout=timeout)
+                            timeout=timeout, cancel=cancel)
         raw = result.output_bytes
         output_bytes = len(raw)
         truncated = output_bytes > TAIL_LIMIT

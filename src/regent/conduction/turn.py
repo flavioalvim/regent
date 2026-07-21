@@ -280,7 +280,8 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             gate_conflict = False
             try:
                 gate = run_gate(root, command=gate_command, declared_in=declared_in,
-                                artifact=gate_artifact, linkage=step, runner=run)
+                                artifact=gate_artifact, linkage=step, runner=run,
+                                cancel=cancel)
                 gate_outcome = gate["outcome"]
             except EvidenceConflict:
                 # The agent pre-created the supervisor's gate evidence path — a
@@ -292,6 +293,25 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
                 gate_outcome = f"GATE_ERROR:{exc}"
             gate_effects = [str(root / p) for _s, p in changed_paths(root)
                             if p not in pre_gate_changes]
+
+            if cancel.is_set():  # an abort was claimed during the gate
+                outcome, detail = "ABORTED", "abort requested during gate"
+                body = _log_body(turn.event_log)
+                evidence.write_main(header(outcome, claude_exit, linkage,
+                                           base_sha=base_sha, attributed=0,
+                                           detail=detail), body)
+                stop.set(); beat.join(timeout=2)
+                _abort.clear_turn_nonce(service.state_dir)
+                turn.cleanup()
+                op = _operational_commit(root, base_sha,
+                                         [str(artifact.relative_to(root))],
+                                         linkage=linkage, outcome="ABORTED",
+                                         token=token, service=service)
+                _stopped_suspend(service, token, "GATED", reason="abort requested")
+                _abort.clear_claimed(service.state_dir, activity_id=activity["id"],
+                                     activity_epoch=activity["epoch"], turn_token=token)
+                return {"ok": False, "outcome": "ABORTED", "files_committed": [],
+                        "artifact": str(artifact), "commit": op, "detail": detail}
 
             # -- VERIFIED (stop check BEFORE the checkpoint) --------------
             _boundary("GATED")

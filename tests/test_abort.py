@@ -1,5 +1,6 @@
 """Directed tests for cancellable runner + abort-request (PLAN-005 STEP-01)."""
 
+import json
 import os
 import subprocess
 import tempfile
@@ -232,6 +233,55 @@ class TurnAbortIntegrationTest(unittest.TestCase):
                                    step="PLAN-005/STEP-01", service=self.service)
         self.assertEqual(rec["state"], "ABORT_MARKER_UNBOUND")
         self.assertTrue(list(self.service.state_dir.glob("abort.claimed-*")))  # kept
+
+    def test_abort_during_gate_is_honored(self):
+        activity = self.service.store.load()["activity"]
+        state_dir = self.service.state_dir
+        act = activity
+
+        class AbortDuringGateRunner:
+            def run(self, argv, *, cwd, timeout, env=None, cancel=None):
+                if argv and argv[0] == "bash":
+                    # the gate: issue the abort now, then honor cancel like the
+                    # cancellable runner would (killed → aborted).
+                    abortmod.write_abort_request(
+                        state_dir, activity_id=act["id"],
+                        activity_epoch=act["epoch"],
+                        turn_token=act["turn"]["token"], reason="abort in gate")
+                    for _ in range(300):  # up to 30s; keepalive ticks each ~1s
+                        if cancel and cancel.is_set():
+                            return RunResult(None, b"", False, aborted=True)
+                        time.sleep(0.1)
+                    return RunResult(0, b"gate ok", False)
+                # agent writes inside the envelope so the turn would otherwise pass
+                settings = json.loads(Path(argv[argv.index("--settings")+1]).read_text())
+                hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].split()
+                he = dict(os.environ, **(env or {}))
+                t = str(Path(cwd) / "work" / "out.txt")
+                for ph in ("PreToolUse", "PostToolUse"):
+                    if ph == "PostToolUse":
+                        Path(t).parent.mkdir(parents=True, exist_ok=True)
+                        Path(t).write_text("x", encoding="utf-8")
+                    subprocess.run(hook + [ph], input=json.dumps(
+                        {"hook_event_name": ph, "tool_name": "Write",
+                         "tool_input": {"file_path": t}, "tool_use_id": "g0"}),
+                        text=True, capture_output=True, env=he)
+                return RunResult(0, b"", False)
+
+        self.plan.write_text("### STEP-01\n- **Gate:** `test -f work/out.txt`\n",
+                             encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "gate"], check=True)
+        result = turnmod.run_turn(
+            self.root, prompt_file=self.prompt, envelope=[str(self.work)],
+            gate_command="test -f work/out.txt", declared_in=self.plan,
+            step="PLAN-005/STEP-01", artifact_dir=self.artdir,
+            linkage="PLAN-005/STEP-01", runner=AbortDuringGateRunner(),
+            service=self.service)
+        self.assertEqual(result["outcome"], "ABORTED")
+        self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+        self.assertEqual(self.service.lock.status()["state"], "free")
+        self.assertFalse(list(self.service.state_dir.glob("abort.claimed-*")))
 
     def test_stop_path_also_releases_lock(self):
         self.service.stop_request(reason="stop")
