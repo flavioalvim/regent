@@ -1,0 +1,1 @@
+{"actor": "mediator", "age_seconds": 2016.698, "at": "2026-07-21T01:14:38+00:00", "event": "turn_lock_takeover", "new_token": "fdf281624378406a88f38a9adc4db82f", "previous_owner": "65881d77831e4fcabab02bae3fc73254", "reason": "executor skipped heartbeats across long review boundaries; owner mediating live ordered proceed", "state_judged": "suspect"}
