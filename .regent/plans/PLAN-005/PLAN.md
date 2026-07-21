@@ -1,4 +1,4 @@
-# PLAN-005 (v2) — Condução fase 3: o loop de turnos + --abort real
+# PLAN-005 (v3) — Condução fase 3: o loop de turnos + --abort real
 
 *v2 após ADVISOR-REVIEW-1 (8 objeções incorporadas — ver CLAUDE-REBUTTAL.md). Mudanças
 arquiteturais: runner CANCELÁVEL (abort implementável), loop lock (exclusão de processos),
@@ -117,3 +117,38 @@ fake-claude (2 STEPs→COMPLETE; abort a meio→ABORTED+SUSPENDED); versão 0.7.
 
 ## Idioma
 Código/CLI/artefatos em inglês (REQ-002); este PLAN.md em PT (mediador PT-BR).
+
+
+## Emendas v3 (residuais do ADVISOR-REVIEW-2, incorporados nos contratos)
+
+1. **Avanço não-falsificável:** "STEP feito" = existe commit ALCANÇÁVEL de HEAD cuja
+   mensagem tem a linha EXATA `Regent-Step: PLAN-NNN/STEP-NN` E que adicionou/modificou
+   `build/STEP-NN.md` E o arquivo existe em HEAD (git log --grep exato + `git show
+   HEAD:<path>` + `git log --format=%H -- <path>` cruzado com o trailer). Commit alheio,
+   trailer parcial ou STEP revertido NÃO avançam.
+2. **Tentativa integrada:** o linkage do turno É `PLAN-NNN/STEP-NN/tryK`; os trailers
+   `Regent-Turn` e o `recover_turn` usam esse linkage completo; `K = max(tryN existentes) +
+   1` (parseando os `TURN-*tryN*` do STEP, não contagem). `LOOP-<slug>.md` inclui o mesmo
+   sufixo de execução (K do 1º turno ou nonce da run) para não colidir entre runs.
+3. **Abort sem corrida entre turnos:** cada `run_turn` grava ATOMICAMENTE um NONCE de
+   execução (`turn.nonce`, uuid4) enquanto o turno está em voo; o `abort.request` é criado
+   com `O_CREAT|O_EXCL` (um pendente por vez; segundo = já-pendente) e a keepalive só honra
+   se há nonce em voo E o vínculo (activity_id/epoch/token) casa; abort sem nonce em voo =
+   no-op consumido (não fica pendurado). Honra única por rename→`.claimed`; stale
+   (vínculo divergente) descartado+auditado.
+4. **Runner sem deadlock:** a versão cancelável DRENA stdout concorrentemente (thread
+   leitora) enquanto faz `communicate(timeout=curto)` em malha; precedência DETERMINÍSTICA
+   cancel > timeout; killpg + join da leitora + reap do grupo. `aborted` distinto de
+   `timed_out`.
+5. **Máquina de abort recuperável:** checkpoint durável das fases
+   `CLAIMED→KILLED→EVIDENCE→SUSPENDED→RELEASED→SUMMARY` (arquivo de fase no XDG, atômico);
+   cada fase idempotente; `recover_turn` estende para detectar abort parcial (`.claimed`
+   presente + atividade ACTIVE) e COMPLETAR a suspensão/summary; crash após suspensão e
+   antes do summary → recuperação reexecuta o op-commit do resumo.
+6. **Mapa exceção→condição COMPLETO:** + `ARTIFACT_OUTSIDE_REGENT`/`STEP_ALREADY_DONE`/
+   `STEP_MISMATCH`/`PROVENANCE`→`LOOP_MISCONFIGURED`; `EvidenceConflict`→`LOOP_CONFLICT`;
+   falha de spawn→`HALTED`(FAILURE); erro git/op-commit→`LOOP_CONFLICT`; erro de
+   suspensão/release→`LOOP_CONFLICT` (preservando SUSPENDED); entrada malformada→`USAGE`.
+   Op-commit não-fencido: usa `base=HEAD` no momento do resumo + CAS de HEAD (aborta se
+   HEAD moveu, corrida com resume), SEM fencing de token (não há token em SUSPENDED); em
+   falha, preserva SUSPENDED e reporta.
