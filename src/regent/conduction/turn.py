@@ -118,20 +118,39 @@ def recover_turn(root: Path, *, linkage: str, step: str,
     if step_file.exists():
         return {"state": "STEP_DONE", "step_file": str(step_file)}
     # An abort claimed but not reconciled (crash between claim and suspend):
-    # complete the suspension idempotently and clear the marker.
+    # complete the suspension idempotently, but ONLY clear the marker once the
+    # activity is genuinely SUSPENDED and the lock released.
+    import json as _json
     from . import abort as _abort
-    if _abort.pending_claimed(service.state_dir):
+    claimed = _abort.pending_claimed(service.state_dir)
+    if claimed:
         control = service.store.load()
-        activity = control.get("activity")
-        if activity is not None and activity["state"] == "ACTIVE":
-            token = activity["turn"]["token"]
+        activity = control.get("activity") or {}
+        # validate the claimed abort belongs to the CURRENT activity/epoch
+        try:
+            marker = _json.loads(claimed[0].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            marker = {}
+        bound = (marker.get("activity_id") == activity.get("id")
+                 and marker.get("activity_epoch") == activity.get("epoch"))
+        if activity.get("state") == "SUSPENDED":
+            _abort.clear_claimed(service.state_dir)
+            return {"state": "ABORT_RECONCILED", "action": "already suspended; /regent resumes"}
+        if activity.get("state") == "ACTIVE" and bound:
             try:
                 service._suspend_locked(checkpoint="turn:ABORT_RECOVERY",
                                         reason="abort reconciled on recovery")
-            except Exception:  # noqa: BLE001
-                pass
-        _abort.clear_claimed(service.state_dir)
-        return {"state": "ABORT_RECONCILED", "action": "activity suspended; /regent resumes"}
+            except Exception as exc:  # noqa: BLE001 — surface, do NOT clear
+                return {"state": "ABORT_RECOVERY_FAILED", "error": repr(exc),
+                        "action": "mediator must reconcile"}
+            if service.store.load()["activity"]["state"] == "SUSPENDED" \
+                    and service.lock.status()["state"] == "free":
+                _abort.clear_claimed(service.state_dir)
+                return {"state": "ABORT_RECONCILED", "action": "suspended; /regent resumes"}
+            return {"state": "ABORT_RECOVERY_INCOMPLETE",
+                    "action": "mediator must reconcile"}
+        # marker not bound to the current activity: leave for the mediator
+        return {"state": "ABORT_MARKER_UNBOUND", "action": "mediator must reconcile"}
     if _dirty_non_exempt(root):
         return {"state": "PARTIAL", "action": "mediator must inspect/discard the "
                 "worktree; a mid-agent turn is never auto-resumed"}

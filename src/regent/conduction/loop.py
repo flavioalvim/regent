@@ -103,6 +103,7 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
     turns: list[dict] = []
     condition = "COMPLETE"
     try:
+      try:
         while True:
             control = service.store.load()
             activity = control.get("activity")
@@ -149,10 +150,17 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
                 turns.append({"step": step, "attempt": attempt,
                               "outcome": "EVIDENCE_CONFLICT", "commit": None})
                 break
-            except (subprocess.CalledProcessError, OSError) as exc:
+            except OSError as exc:
+                # spawn / IO failure of the turn itself → treat as a failed turn
+                condition = "HALTED"
+                turns.append({"step": step, "attempt": attempt,
+                              "outcome": "FAILURE",
+                              "detail": f"{type(exc).__name__}: {exc}", "commit": None})
+                break
+            except subprocess.CalledProcessError as exc:
                 condition = "LOOP_CONFLICT"
                 turns.append({"step": step, "attempt": attempt,
-                              "outcome": f"ERROR:{type(exc).__name__}", "commit": None})
+                              "outcome": f"GIT_ERROR:{exc.returncode}", "commit": None})
                 break
             finally:
                 try:
@@ -175,7 +183,16 @@ def run_loop(root: Path, *, plan_id: str, prompt_template: Path, envelope: list[
                 break
             condition = "LOOP_CONFLICT"
             break
-        _write_loop_evidence(root, artifact_dir, service, condition, turns)
+      except subprocess.CalledProcessError:
+        condition = "LOOP_CONFLICT"
+      try:
+        summary_conflict = _write_loop_evidence(root, artifact_dir, service,
+                                                condition, turns)
+        if summary_conflict and condition == "COMPLETE":
+            condition = "LOOP_CONFLICT"  # a mandatory summary could not commit
+      except subprocess.CalledProcessError:
+        if condition == "COMPLETE":
+            condition = "LOOP_CONFLICT"
     finally:
         loop_lock.__exit__(None, None, None)
 
@@ -198,7 +215,7 @@ def _write_loop_evidence(root: Path, artifact_dir: Path, service: ActivityServic
     evidence = EvidenceSet(artifact, {})
     try:
         evidence.precheck()
-    except Exception:  # noqa: BLE001 — never block on evidence naming
+    except _EvidenceConflict:  # never block on evidence naming
         artifact = artifact_dir / f"LOOP-{slug}-{len(list(artifact_dir.glob('LOOP-*')))}.md"
         evidence = EvidenceSet(artifact, {})
     body = "\n".join(
@@ -225,21 +242,23 @@ def _write_loop_evidence(root: Path, artifact_dir: Path, service: ActivityServic
         base_tree = _git(root, "rev-parse", "HEAD^{tree}").strip()
         tree = _git(root, "write-tree", env=env).strip()
         if tree == base_tree:
-            return
-        if token is not None:
-            try:
-                assert_turn_token(service.store.load(), token)
-            except NotLockOwner:
-                return  # taken over; leave summary uncommitted
+            return False
         msg = (f"loop(PLAN-005): {condition} summary ({len(turns)} turns)\n\n"
                f"Regent-Loop: {condition}")
         commit = _git(root, "commit-tree", tree, "-p", base_sha, "-m", msg,
                       env=env).strip()
+        # Fencing + CAS in the SMALLEST window right before advancing HEAD.
+        if token is not None:
+            try:
+                assert_turn_token(service.store.load(), token)
+            except NotLockOwner:
+                return True  # taken over — summary NOT committed (conflict)
         if _git(root, "rev-parse", "HEAD").strip() != base_sha:
-            return  # HEAD moved (raced with resume)
+            return True  # HEAD moved (raced with resume) — conflict
         _git(root, "update-ref", "-m", "regent loop summary", "HEAD", commit, base_sha,
              env=env)
         _git(root, "reset", "--mixed", "HEAD")
+        return False
     finally:
         try:
             index.unlink()
