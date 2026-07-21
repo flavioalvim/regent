@@ -440,6 +440,9 @@ def explain_control_diff(before: dict, after: dict,
 
     accountable = 0
     b_req, a_req = before.get("stop_request"), after.get("stop_request")
+    discard_events = [e for e in (audit_delta or [])
+                      if e.get("event") == "stop_request_discarded"]
+    matched_discard_ids: set = set()
     if b_req != a_req:
         activity = after.get("activity") or before.get("activity")
         arrival_ok = (b_req is None and isinstance(a_req, dict)
@@ -448,27 +451,38 @@ def explain_control_diff(before: dict, after: dict,
                       and a_req.get("activity_epoch") == activity.get("epoch")
                       and set(a_req) == {"id", "activity_id", "activity_epoch",
                                          "turn_token", "reason", "requested_at"})
-        if arrival_ok:
+        discard_ok = (isinstance(b_req, dict) and a_req is None
+                      and any(e.get("request_id") == b_req.get("id")
+                              for e in discard_events))
+        if arrival_ok or discard_ok:
             explained.append("stop_request")
             accountable += 1
+            if discard_ok:
+                matched_discard_ids.add(b_req.get("id"))
         else:
             unexplained.append("stop_request")
     for event in (audit_delta or []):
         name = event.get("event")
-        if name in ALLOWED_STEP_AUDIT_EVENTS and event.get("request_id"):
-            accountable += 1  # an audited discard also bumps the version
+        if name == "stop_request_discarded":
+            # An audit discard is only explained by its MATCHING observed
+            # transition; an invented/unmatched event never buys version credit.
+            if event.get("request_id") not in matched_discard_ids:
+                unexplained.append("audit:stop_request_discarded-unmatched")
         else:
             unexplained.append(f"audit:{name}")
 
     b_ver, a_ver = before.get("version"), after.get("version")
     if b_ver != a_ver:
-        delta = (a_ver - b_ver) if isinstance(a_ver, int)             and isinstance(b_ver, int) else None
-        if delta is not None and 0 < delta <= accountable:
+        delta = (a_ver - b_ver) if isinstance(a_ver, int) \
+            and isinstance(b_ver, int) else None
+        # EXACT accounting: the version moved once per explained mutation,
+        # no more, no less. Anything else is unexplained churn.
+        if delta is not None and accountable > 0 and delta == accountable:
             explained.append("version")
             if before.get("updated_at") != after.get("updated_at"):
                 explained.append("updated_at")
         else:
-            unexplained.append("version")  # bare/unaccounted version churn
+            unexplained.append("version")
     elif before.get("updated_at") != after.get("updated_at"):
         unexplained.append("updated_at")
 

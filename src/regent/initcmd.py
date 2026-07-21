@@ -119,7 +119,7 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
 
     states = {}
     for kind, path, payload in plan:
-        if kind != "symlink" and _escapes_root(project_root, path):
+        if _escapes_root(project_root, path):
             states[path] = "divergent"  # symlinked ancestor escaping the host
             continue
         key = _manifest_key(project_root, path)
@@ -148,10 +148,9 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
               "this run completes it (manifest re-run is idempotent).", file=out)
     regent_dir_created = not (project_root / ".regent").exists()
     (project_root / ".regent").mkdir(exist_ok=True)
-    journal.write_text(json.dumps(
+    _atomic_write(journal, json.dumps(
         {"at": __import__("regent.protocol.audit", fromlist=["utcnow"]).utcnow(),
-         "paths": [str(p.relative_to(project_root)) for _, p, _ in todo]}),
-        encoding="utf-8")
+         "paths": [str(p.relative_to(project_root)) for _, p, _ in todo]}))
 
     created: list[Path] = []
     replaced: list[tuple[Path, bytes]] = []
@@ -182,8 +181,8 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
             journal.unlink()  # the rollback itself converged; marker done
             if regent_dir_created:
                 (project_root / ".regent").rmdir()
-        except OSError:
-            pass
+        except OSError as cleanup_exc:
+            failures.append(f"{journal} ({cleanup_exc})")
         if failures:
             print(f"error: seeding failed ({exc}); rollback INCOMPLETE — "
                   f"unrestored: {failures}. Re-run init to converge "
@@ -199,8 +198,9 @@ def run_init(project_root: Path, out=sys.stdout) -> int:
               + (" (symlink)" if kind == "symlink" else ""), file=out)
     try:
         journal.unlink()
-    except OSError:
-        pass
+    except OSError as exc:
+        print(f"warning: could not remove the install journal ({exc}); the next "
+              f"init will report an unfinished run.", file=out)
     _warn_missing_clis(out)
     print("regent initialized. Open a Claude Code session here and use /regent.",
           file=out)

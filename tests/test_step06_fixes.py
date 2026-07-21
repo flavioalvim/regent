@@ -158,6 +158,52 @@ class Step06FixesTest(unittest.TestCase):
         self.assertIn("audit:history-not-append-only",
                       payload["detail"]["unexplained"])
 
+    def test_explain_matched_discard_approved_invented_refused(self):
+        req = {"id": "ab" * 16, "activity_id": "PLAN-A", "activity_epoch": 0,
+               "turn_token": None, "reason": None, "requested_at": "t1"}
+        before = {"schema_version": 1, "version": 7, "updated_at": "t1",
+                  "activity": {"id": "PLAN-A", "epoch": 0}, "stop_request": req,
+                  "last_concluded": None}
+        # Legitimate: request vanished WITH its matching audited discard, delta 1.
+        after = dict(before, version=8, updated_at="t2", stop_request=None)
+        diff = explain_control_diff(before, after,
+                                    audit_delta=[{"event": "stop_request_discarded",
+                                                  "request_id": req["id"]}])
+        self.assertEqual(diff["unexplained"], [])
+        self.assertIn("stop_request", diff["explained"])
+        self.assertIn("version", diff["explained"])
+        # Invented audit event with NO matching transition buys no credit.
+        bumped = dict(before, version=8, updated_at="t2")
+        diff = explain_control_diff(before, bumped,
+                                    audit_delta=[{"event": "stop_request_discarded",
+                                                  "request_id": "ff" * 16}])
+        self.assertIn("audit:stop_request_discarded-unmatched",
+                      diff["unexplained"])
+        self.assertIn("version", diff["unexplained"])
+
+    def test_explain_delta_must_equal_accounting_exactly(self):
+        before = {"schema_version": 1, "version": 5, "updated_at": "t1",
+                  "activity": {"id": "PLAN-A", "epoch": 0}, "stop_request": None,
+                  "last_concluded": None}
+        arrival = {"id": "ab" * 16, "activity_id": "PLAN-A", "activity_epoch": 0,
+                   "turn_token": None, "reason": None, "requested_at": "t2"}
+        # One explained mutation but delta 2: refused.
+        after = dict(before, version=7, updated_at="t2", stop_request=arrival)
+        diff = explain_control_diff(before, after)
+        self.assertIn("version", diff["unexplained"])
+
+    def test_init_refuses_claude_skills_symlink_escape(self):
+        import io
+        outside = Path(self._tmp.name) / "outside-claude"
+        outside.mkdir()
+        claude = self.root / ".claude"
+        claude.mkdir()
+        (claude / "skills").symlink_to(outside)  # integration dir escapes host
+        out = io.StringIO()
+        code = run_init(self.root, out=out)
+        self.assertEqual(code, EXIT_CONFLICT)
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_init_refuses_ancestor_symlink_escape(self):
         import io
         import shutil
