@@ -1,5 +1,16 @@
 {
-  "activity": null,
+  "activity": {
+    "epoch": 1,
+    "id": "PLAN-004",
+    "state": "ACTIVE",
+    "suspension": null,
+    "turn": {
+      "acquired_at": "2026-07-21T01:27:39+00:00",
+      "owner": "executor",
+      "token": "1e340c1b218848c4afcca1a4fcf7a378"
+    },
+    "type": "plan"
+  },
   "last_concluded": {
     "at": "2026-07-21T01:14:39+00:00",
     "epoch": 0,
@@ -9,6 +20,6 @@
   },
   "schema_version": 1,
   "stop_request": null,
-  "updated_at": "2026-07-21T01:14:39+00:00",
-  "version": 3
+  "updated_at": "2026-07-21T01:27:39+00:00",
+  "version": 4
 }
