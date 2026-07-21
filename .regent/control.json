@@ -1,25 +1,14 @@
 {
-  "activity": {
+  "activity": null,
+  "last_concluded": {
+    "at": "2026-07-21T03:52:34+00:00",
     "epoch": 4,
     "id": "PLAN-005",
-    "state": "ACTIVE",
-    "suspension": null,
-    "turn": {
-      "acquired_at": "2026-07-21T02:51:53+00:00",
-      "owner": "executor",
-      "token": "a03650cd39f745bc9091b7271ab55410"
-    },
+    "status": "ACCEPTED-WITH-RESERVATIONS",
     "type": "build"
-  },
-  "last_concluded": {
-    "at": "2026-07-21T02:51:27+00:00",
-    "epoch": 3,
-    "id": "PLAN-005",
-    "status": "APPROVED",
-    "type": "plan"
   },
   "schema_version": 1,
   "stop_request": null,
-  "updated_at": "2026-07-21T02:51:53+00:00",
-  "version": 10
+  "updated_at": "2026-07-21T03:52:34+00:00",
+  "version": 11
 }
