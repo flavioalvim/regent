@@ -1,0 +1,77 @@
+name: publish
+
+# Trusted Publishing to PyPI via OIDC — NO API token. PyPI mints a short-lived
+# credential for this exact (repo, workflow, environment) tuple at run time.
+# Configure the trusted publisher once at:
+#   https://pypi.org/manage/project/regent-cli/settings/publishing/
+#     Owner: flavioalvim | Repository: regent
+#     Workflow name: publish.yml | Environment: pypi
+#
+# Release flow: bump the version in pyproject.toml + src/regent/__init__.py,
+# then publish a GitHub Release whose tag is the version (e.g. v0.8.0 or 0.8.0).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:  # manual re-run without cutting a new release
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Configure git identity (the suite creates real repos)
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+      - name: Run the test suite
+        run: PYTHONPATH=src python -m unittest discover -s tests
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure git identity
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.com
+      - name: Canonical fail-closed gate (suite + build + twine --strict)
+        run: bash scripts/gate-package.sh
+      - name: Version must match the release tag
+        if: github.event_name == 'release'
+        run: |
+          VERSION=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "pyproject=$VERSION tag=$TAG"
+          test "$VERSION" = "$TAG" || { echo "::error::pyproject version ($VERSION) != release tag ($TAG)"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi          # protect this environment in repo settings
+    permissions:
+      id-token: write          # OIDC: mint the short-lived PyPI credential
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
