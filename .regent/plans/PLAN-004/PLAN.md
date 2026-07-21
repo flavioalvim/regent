@@ -1,129 +1,166 @@
-# PLAN-004 — Condução fase 2: o turno supervisionado com executor confinado
+# PLAN-004 (v2) — Condução fase 2: o turno supervisionado com executor confinado
+
+*v2 após ADVISOR-REVIEW-1 (7 objeções incorporadas — ver CLAUDE-REBUTTAL.md). Mudança
+central: a prova de atribuição REANCORADA no GIT (baseline global + blob verificado +
+índice privado + CAS de HEAD, como na IMP-003); o HMAC vira auditoria/defense-in-depth,
+NÃO anti-forja do agente (o agente é semi-confiável e pode ler o segredo).*
 
 ## Objetivo
 
-`regent turn run` executa UM turno de produção com um `claude -p` **confinado** — o
-mecanismo provado no LOTE-02 da IMP-003, reimplementado sobre a fundação do regent: o
-agente só escreve dentro do **envelope** declarado (hook PreToolUse nega o resto), cada
-evento é autenticado por **HMAC com segredo por turno** (o agente não consegue forjar o
-log), e quem roda gate, registra evidência e **commita é o SUPERVISOR** — nunca o agente.
+`regent turn run` executa UM turno de produção de um STEP de build com um `claude -p`
+**confinado**: o agente só ESCREVE dentro do envelope (hook PreToolUse DENY — garantia
+primária de confinamento), e quem verifica, roda gate, registra evidência e **commita é o
+SUPERVISOR** por índice privado com prova git (garantia primária de atribuição). É COMO um
+STEP do REQ-005 é executado por um agente, não um caminho paralelo.
+
+## Modelo de confiança (explícito)
+
+Single-host, agente SEMI-CONFIÁVEL. Assumimos que o agente PODE ler qualquer arquivo
+(inclusive o segredo). Portanto:
+- **Confinamento** = hook PreToolUse DENY (o agente não CONSEGUE escrever fora do
+  envelope), reforçado por `--tools` restritivo e config isolada.
+- **Atribuição** = GIT verificado pelo supervisor (baseline limpo → diff global == conjunto
+  atribuído, blobs conferidos), NÃO o HMAC.
+- **HMAC** = auditoria: detecta corrupção acidental e adulteração por TERCEIROS do log;
+  declarado como tal, sem alegar anti-forja do agente.
 
 ## Escopo
 
-**Dentro:** `src/regent/conduction/{confine,hookscript,turnlog,turn}.py` + subcomando
-`regent turn run`; o próprio hook (script standalone que o Claude Code invoca); testes com
-`fake-claude` injetado (suíte determinística sem o claude real); e2e com fake-claude;
-smoke manual opcional com claude real (registrado, não gate).
+**Dentro:** `src/regent/conduction/{confine,hookscript,turnlog,turn}.py` + `regent turn
+run`; o hook standalone; testes exercitando o HOOK REAL + `fake-claude` (simula o agente
+invocando o hook com payloads reais); e2e fake-claude; smoke opcional com claude real
+(registrado, não-gate).
 
-**Fora (fase 3):** daemon/loop contínuo, decisão automática de próximo turno, activation
-rules, `--abort`, ensaio, publicação PyPI.
+**Fora (fase 3):** daemon/loop, decisão de próximo turno, activation rules, `--abort`,
+ensaio, publicação PyPI.
 
 ## Contratos normativos
 
-### Composição do confinamento (`confine.py`)
-- Diretório PRIVADO por turno (tmpdir do supervisor, fora do repo): `settings.json`
-  gerado (hooks PreToolUse+PostToolUse apontando para a CÓPIA privada do hook script,
-  com env `REGENT_TURN_SECRET` (32 bytes hex por turno), `REGENT_ENVELOPE` (JSON de
-  paths) e `REGENT_EVENT_LOG` (path privado do log)); imutável durante o turno.
-- Lançamento: `claude -p <prompt> --settings <private-settings> --permission-mode
-  acceptEdits` **sem Bash** na lista de tools (lição empírica IMP-003/LOTE-02:
-  acceptEdits é obrigatório — o confinamento é o DENY do hook; dontAsk nega tudo).
-  stdin=DEVNULL; start_new_session; timeout mata o grupo (runner do PLAN-003).
-- O prompt do turno recebe o envelope e a tarefa; o agente NUNCA recebe o segredo por
-  argumento (só via env do hook — o processo do claude não o vê).
+### Confinamento (`confine.py`)
+- Dir PRIVADO por turno (tmpdir do supervisor, FORA do repo): `settings.json` gerado com
+  hooks Pre/PostToolUse apontando para a CÓPIA privada de `hookscript.py`. Env do lançamento
+  MÍNIMO (allowlist: PATH, HOME, e os `REGENT_*`); imutável no turno.
+- Launch: `claude -p <prompt> --setting-sources "" --settings <priv> --tools
+  Read,Write,Edit,MultiEdit --permission-mode acceptEdits` (sem Bash; acceptEdits é lição
+  empírica IMP-003 — o confinamento é o DENY do hook). stdin=DEVNULL; start_new_session;
+  timeout mata o grupo. `--setting-sources ""` = NENHUMA config herdada (user/project/
+  local/plugins/MCP).
+- Segredo (`REGENT_TURN_SECRET`, 32B hex) e `REGENT_ENVELOPE`/`REGENT_EVENT_LOG` vão no
+  env do hook via settings privado. NÃO alegamos que o agente não os vê (modelo de
+  confiança acima).
 
-### O hook (`hookscript.py` — standalone, copiado para o dir privado)
-- PreToolUse: permite Write/Edit/MultiEdit SOMENTE em paths cujo real-path (após resolver
-  symlinks/`..`) esteja DENTRO do envelope; qualquer outra ferramenta de
-  escrita/execução (Bash incluso, defesa em profundidade) = DENY. Decisões não-write
-  (Read etc.) = allow.
-- PostToolUse: apenda ao event log UMA linha JSON
-  `{seq, tool, path, decision, content_sha256, hmac}` onde `hmac =
-  HMAC(secret, seq‖tool‖path‖decision‖content_sha256‖hmac_anterior)` — CADEIA (remoção/
-  reordenação/injeção detectáveis).
-- O hook falha FECHADO: qualquer erro interno → DENY + evento `hook_error`.
+### Hook (`hookscript.py`, standalone — semântica oficial do Claude Code)
+- **PreToolUse** (recebe `tool_name`, `tool_input`, `tool_use_id`): Write/Edit/MultiEdit
+  → allow SÓ se o real-path canônico (symlinks + `..` resolvidos) ∈ envelope; senão deny.
+  Qualquer outra tool de escrita/execução = deny (defesa em profundidade). Read etc. =
+  allow. Emite evento `pre` com `decision: allow|deny` correlacionado por `tool_use_id`.
+- **PostToolUse** (após sucesso da escrita): emite evento `post` com `content_sha256` do
+  arquivo resultante, correlacionado ao `tool_use_id`. (DENY não gera Post — por desenho.)
+- Append ao log: 1 linha JSON canônica (sort_keys) sob **flock** (hooks concorrentes),
+  com `seq` monotônico e `hmac = HMAC(secret, canonical_line_sem_hmac ‖ hmac_anterior)`.
+- Falha FECHADA: erro interno → deny + evento `hook_error`.
 
-### Verificação pós-turno (`turnlog.py`)
-- Recomputa a cadeia HMAC do log com o segredo do turno: quebra em qualquer elo =
-  `TURN_TAMPERED`.
-- `git status --porcelain` do repo: todo path alterado DEVE (a) estar no envelope E (b)
-  ter evento `allow` correspondente no log; senão `TURN_VIOLATION`. Exceção: os
-  exceptuados operacionais (`control.json`/`audit.jsonl`) seguem a coreografia do
-  PLAN-002 (atribuibilidade via `regent control explain`).
-- Nada é "consertado" automaticamente: violação = falha fail-closed com relatório; o
-  worktree fica para o mediador decidir (default-deny, P-03 na prática).
+### Verificação pós-turno (`turnlog.py`) — PROVA PELO GIT
+1. **Cadeia HMAC** recomputada + **selo terminal** que o supervisor grava ao fim (ausência
+   = log truncado/removido) → quebra = `TURN_TAMPERED`.
+2. **Diff global == conjunto atribuído:** baseline = HEAD limpo (pré-condição). Após o
+   turno: para CADA path em `git status --porcelain`:
+   - deve ∈ envelope (ou ser exceptuado operacional PLAN-002);
+   - o `content_sha256` do blob no worktree deve casar o do último evento `post` daquele
+     `tool_use_id`/path; tipo/modo/deleção conferidos;
+   - nenhum path alterado sem evento `post` correspondente.
+   Qualquer divergência = `TURN_VIOLATION`. Nada é consertado (default-deny; worktree fica
+   para o mediador).
+3. **Efeitos do gate:** o gate roda ANTES da verificação; o que o gate tocou é submetido à
+   MESMA prova — path fora do envelope tocado pelo gate = violação (o envelope deve
+   declarar os paths que o gate legitimamente altera, ex.: `dist/` no gate-package).
 
 ### `regent turn run`
 `regent turn run --prompt-file P --envelope <path> [--envelope ...] --gate-command C
---declared-in <plan> --artifact-dir DIR --linkage L [--timeout 1800] [--claude-bin B]`
-- Pré-condições: atividade `build` ACTIVE com token corrente (camada de aplicação;
-  heartbeat no início e entre TODAS as fases); `stop check` entre fases — stop presente =
-  suspensão canônica com checkpoint da fase.
-- Sequência: compose → launch → verify (turnlog) → gate (`run_gate` do PLAN-003) →
-  evidência `DIR/TURN-<linkage-slug>.md` (header: `outcome: TURN_OK|TURN_VIOLATION|
-  TURN_TAMPERED|GATE_RED|TIMEOUT|FAILURE`, exit do claude, resumo de eventos, paths
-  tocados, digest do log; corpo: log de eventos íntegro) — conjunto atômico do PLAN-003
-  (evidência nunca sobrescrita, órfãos limpos) → **commit do SUPERVISOR**: stage
-  arquivo-a-arquivo SÓ (envelope tocado com evento allow) + artefatos do turno +
-  exceptuados atribuíveis; trailer `Regent-Turn: <linkage>`; agente jamais commita.
-- stdout JSON `{"ok": bool, "outcome", "files_committed": [...], "artifact", "commit":
-  sha|null}`; exit 0 SÓ com TURN_OK+GREEN; códigos novos declarados: `TURN_VIOLATION`(3),
-  `TURN_TAMPERED`(3), `TURN_FAILED`(3) — catálogo estendido.
-- Gate RED: SEM commit de produto; evidência commitada em commit operacional; exit
-  GATE_RED (o chamador decide re-tentar turno novo).
+--declared-in <plan> --step <PLAN-NNN/STEP-NN> --artifact-dir <sob .regent/> --linkage L
+[--timeout 900] [--claude-bin B]`
+- **Pré-condições:** atividade `build` ACTIVE + token corrente (camada de aplicação);
+  `--artifact-dir` sob `.regent/` (REQ-001) senão erro; `--declared-in` contém o
+  gate-command verbatim (proveniência, PLAN-003); **worktree limpo** exceto exceptuados.
+- **Fases** (idempotentes; heartbeat antes de cada; `stop check` entre elas → suspensão
+  canônica com checkpoint da fase): COMPOSED → LAUNCHED (claude confinado; keep-alive
+  heartbeat em thread durante o launch) → VERIFIED (turnlog: HMAC+selo, diff==atribuído)
+  → GATED (`run_gate` do PLAN-003; heartbeat antes) → COMMITTED.
+- **Commit do SUPERVISOR** (nunca o agente): índice PRIVADO (`GIT_INDEX_FILE`), stage
+  arquivo-a-arquivo APENAS do conjunto atribuído (envelope ∩ eventos post ∩ diff) +
+  artefatos do turno + exceptuados atribuíveis; **CAS de HEAD** (se HEAD mudou desde o
+  baseline → aborta, `CONFLICT`); trailer `Regent-Step: PLAN-NNN/STEP-NN` +
+  `Regent-Turn: <linkage>`.
+- Evidência `--artifact-dir/TURN-<slug>.md` (conjunto atômico PLAN-003; header:
+  `outcome: TURN_OK|TURN_VIOLATION|TURN_TAMPERED|GATE_RED|TIMEOUT|FAILURE`, claude_exit,
+  resumo de eventos, paths atribuídos, digest do log; corpo: log íntegro). Persistida em
+  TODO desfecho.
+- stdout JSON `{"ok": bool, "outcome", "files_committed": [...], "artifact",
+  "commit": sha|null}`; exit 0 SÓ com TURN_OK+GREEN. Códigos novos declarados:
+  `TURN_VIOLATION`(3), `TURN_TAMPERED`(3), `TURN_FAILED`(3).
+- **Gate RED / violação:** SEM commit de produto; evidência entra em commit OPERACIONAL;
+  exit ≠0 (o chamador decide turno novo).
+
+### Fencing de token e timeout
+Timeout default do turno = **900s** (< `stale_after` 1800s da fase 1); heartbeats
+keep-alive em thread durante launch e gate para o token NUNCA virar suspect a meio-turno;
+o commit reverifica o token (fencing) antes de gravar.
 
 ### Injeção para testes
-Runner injetável (PLAN-003) + `fake-claude` (script sh que lê REGENT_* do settings
-gerado?— NÃO: o fake simula o AGENTE: recebe --settings, executa "escritas" chamando o
-hook real como o Claude Code faria: invoca o hook PreToolUse/PostToolUse com payloads
-JSON reais). Os testes exercitam o HOOK VERDADEIRO (não um mock dele) em todos os
-cenários: permitido, fora-do-envelope negado, Bash negado, cadeia HMAC íntegra,
-adulteração detectada (linha editada/removida/injetada/reordenada), hook_error fail-closed.
+`fake-claude` = script que simula o AGENTE: recebe `--settings`, lê o hook configurado e o
+INVOCA com payloads PreToolUse/PostToolUse reais (JSON) para cada "escrita" que tenta —
+exercitando o HOOK VERDADEIRO. Cenários: escrita no envelope (allow+post), fora do
+envelope (deny, sem escrita), Bash (deny), symlink/`..` escape (deny), cadeia íntegra,
+adulteração (edição/remoção/injeção/reordenação/remoção-do-último), hook_error.
 
 ## Etapas
 
-### STEP-01 — Hook + cadeia autenticada (`hookscript.py`, `turnlog.py`)
+### STEP-01 — Hook + cadeia + selo (`hookscript.py`, `turnlog.py`)
 - **Testes:** `test_hook_allows_envelope_write`, `test_hook_denies_outside_envelope`,
   `test_hook_denies_symlink_and_dotdot_escape`, `test_hook_denies_bash_and_exec_tools`,
-  `test_hook_error_fails_closed`, `test_chain_verifies_clean_log`,
-  `test_chain_detects_{edit,removal,injection,reorder}`, `test_verify_flags_unlogged_change`,
-  `test_verify_respects_operational_exemptions`.
+  `test_hook_error_fails_closed`, `test_pre_post_correlated_by_tool_use_id`,
+  `test_chain_verifies_clean_log_with_terminal_seal`,
+  `test_chain_detects_{edit,removal,injection,reorder,last_event_removal}`,
+  `test_missing_terminal_seal_is_tampered`, `test_concurrent_append_flock_serialized`.
 - **Gate:** `PYTHONPATH=src python3 -m unittest discover -s tests`
 
-### STEP-02 — Composição do confinamento (`confine.py`)
-- **Testes:** `test_compose_private_dir_immutable_settings`,
-  `test_secret_only_in_hook_env_not_argv`, `test_claude_argv_has_no_bash_tool`,
-  `test_permission_mode_acceptedits_forced`, `test_compose_cleanup_on_failure`.
+### STEP-02 — Confinamento + prova git (`confine.py`, verificação de diff em `turnlog.py`)
+- **Testes:** `test_compose_isolated_settings_sources_empty`,
+  `test_claude_argv_tools_restrictive_no_bash`, `test_permission_mode_acceptedits_forced`,
+  `test_env_is_minimal_allowlist`, `test_compose_cleanup_on_failure`,
+  `test_diff_equals_attributed_set_ok`, `test_unlogged_change_is_violation`,
+  `test_blob_sha_mismatch_is_violation`, `test_gate_touching_outside_envelope_violation`,
+  `test_operational_exemptions_pass`.
 - **Gate:** `PYTHONPATH=src python3 -m unittest discover -s tests`
 
-### STEP-03 — `regent turn run` (orquestração + commit do supervisor)
-- **Testes:** `test_turn_ok_commits_only_enveloped_files_with_trailer`,
-  `test_turn_violation_fails_closed_no_product_commit`,
-  `test_turn_tampered_detected`, `test_gate_red_no_product_commit_evidence_operational`,
+### STEP-03 — `regent turn run` (orquestração + commit por índice privado)
+- **Testes:** `test_turn_ok_commits_attributed_set_with_step_and_turn_trailers`,
+  `test_supervisor_commit_uses_private_index_and_head_cas`,
+  `test_turn_violation_fails_closed_no_product_commit`, `test_turn_tampered_detected`,
+  `test_gate_red_no_product_commit_evidence_operational`,
   `test_stop_between_phases_suspends_with_phase_checkpoint`,
-  `test_requires_active_build_activity_and_token`,
-  `test_heartbeats_at_every_phase`, `test_timeout_kills_claude_group`.
+  `test_requires_active_build_activity_and_token`, `test_artifact_dir_must_be_under_regent`,
+  `test_head_moved_since_baseline_conflicts`, `test_timeout_kills_claude_group`,
+  `test_keepalive_heartbeat_prevents_suspect`.
 - **Gate:** `PYTHONPATH=src python3 -m unittest discover -s tests`
 
 ### STEP-04 — Consolidação 0.6.0
-Skills: seção de build do `/regent` ganha o turno mecanizado como opção prescrita
-(anti-drift); e2e fake-claude completo (turno OK + violação) registrado; smoke manual
-com claude real REGISTRADO se disponível (não-gate); versão 0.6.0.
+Skill de build do `/regent`: o turno mecanizado como opção prescrita (anti-drift); e2e
+fake-claude completo (TURN_OK + violação + tampered) registrado; smoke com claude real
+REGISTRADO se disponível (não-gate); versão 0.6.0.
 - **Testes:** `test_cli_version_reports_060`, anti-drift atualizado.
 - **Gate:** `bash scripts/gate-package.sh`
 
 ## Riscos
-
-1. **Formato dos hooks do Claude Code muda entre versões** → o hook lê o payload JSON
-   documentado e falha FECHADO em formato desconhecido (DENY); smoke manual registrado.
-2. **Fake-claude divergir do real** → o fake invoca o HOOK verdadeiro com payloads reais;
-   o contrato testado é o do hook, não o do claude.
-3. **Escapes de path (symlink/../case)** → real-path canônico antes do teste de envelope
-   (teste dedicado).
-4. **Agente lendo o segredo** → segredo só no env DO HOOK (settings privado), nunca em
-   argv/prompt; teste de composição garante.
-5. **Commit contaminado** → staging arquivo-a-arquivo da interseção (envelope ∩ eventos
-   allow ∩ git status) + coreografia dos exceptuados (PLAN-002).
+1. Formato de hook do Claude Code muda → hook lê o payload documentado e falha FECHADO em
+   formato desconhecido (deny); smoke real registrado.
+2. Fake-claude diverge do real → o fake invoca o HOOK verdadeiro; o contrato testado é o
+   do hook.
+3. Escapes de path → real-path canônico antes do teste de envelope (teste dedicado).
+4. Config herdada → `--setting-sources ""` + env mínimo + `--tools` restritivo (testado).
+5. Commit contaminado → prova git (baseline global + blob conferido + índice privado + CAS
+   de HEAD); o HMAC é só auditoria.
+6. Token suspect a meio-turno → timeout 900 < stale 1800 + heartbeats keep-alive.
 
 ## Idioma
 Código/CLI/artefatos em inglês (REQ-002); este PLAN.md em PT (mediador PT-BR).
