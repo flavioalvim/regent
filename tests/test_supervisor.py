@@ -155,6 +155,25 @@ class SupervisorTest(unittest.TestCase):
         self.assertFalse(r["disarmed"])
         self.assertIsNotNone(sup._raw_arm(self.service.state_dir))  # still armed
 
+    def test_read_arm_discard_no_audit_when_removal_fails(self):
+        # advisor finding #2 (round 3): the audit must NOT claim discarded if the
+        # removal fails.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        def fn(body):  # invalidate binding so read_arm attempts discard
+            body["activity"]["turn"]["token"] = "cc" * 16
+            return body
+        self.service.store.mutate(fn)
+        import regent.conduction.supervisor as mod
+        orig = mod._unlink_durable
+        mod._unlink_durable = lambda p: (_ for _ in ()).throw(OSError("boom"))
+        try:
+            self.assertIsNone(sup.read_arm(self.service))  # still returns None
+        finally:
+            mod._unlink_durable = orig
+        events = [e.get("event") for e in self.service.audit.read_all()]
+        self.assertNotIn("arm_token_discarded", events)  # never claimed
+        self.assertIsNotNone(sup._raw_arm(self.service.state_dir))  # token kept
+
     def test_arm_persists_canonical_absolute_paths(self):
         # advisor finding #3 (round 2): the token stores CANONICAL absolute paths
         # so the daemon behaves the same from any CWD.
@@ -345,6 +364,21 @@ class SupervisorTest(unittest.TestCase):
                            runner=_fake_agent_runner({}), on_state=boom)
         self.assertEqual(r["final_state"], "DISARMED")
         self.assertIsNone(sup.read_arm(self.service))
+
+    def test_daemon_reports_disarm_failed_when_removal_persists_failing(self):
+        # advisor finding #1 (round 3): a terminal that cannot remove the token
+        # must report DISARM_FAILED (still armed), never a clean terminal.
+        sup.arm(self.service, plan_id="PLAN-006", config=self._config())
+        import regent.conduction.supervisor as mod
+        orig = mod._unlink_durable
+        mod._unlink_durable = lambda p: (_ for _ in ()).throw(OSError("boom"))
+        try:
+            r = sup.run_daemon(self.service, once=True, runner=_fake_agent_runner({}))
+        finally:
+            mod._unlink_durable = orig
+        self.assertEqual(r["final_state"], "DISARM_FAILED")
+        self.assertFalse(r["ok"])
+        self.assertIsNotNone(sup._raw_arm(self.service.state_dir))  # still armed
 
     def test_daemon_disarms_on_unexpected_failure(self):
         # advisor finding #4: a non-LoopError escaping run_loop must still disarm.

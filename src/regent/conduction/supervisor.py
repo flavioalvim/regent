@@ -217,13 +217,14 @@ def read_arm(service: ActivityService) -> dict | None:
         with _arm_lock(service.state_dir):
             current = _raw_arm(service.state_dir)
             if current is not None and current.get("arm_id") == payload.get("arm_id"):
-                service.audit.append({"event": "arm_token_discarded",
-                                      "arm_id": payload.get("arm_id"),
-                                      "reason": "binding no longer current"})
                 try:
                     _unlink_durable(_arm_path(service.state_dir))
                 except OSError:
                     pass  # leave it; re-evaluated next cycle (never claims removed)
+                else:  # audit ONLY after the removal actually succeeded
+                    service.audit.append({"event": "arm_token_discarded",
+                                          "arm_id": payload.get("arm_id"),
+                                          "reason": "binding no longer current"})
     except MutationMutexBusy:
         pass
     return None
@@ -249,6 +250,22 @@ def disarm(service: ActivityService, *, arm_id: str | None = None) -> dict:
 
 
 # -- foreground daemon ----------------------------------------------------
+
+# Disarm reasons that mean the token is already effectively gone (removed or
+# superseded by a rearm) — NOT a failure to remove.
+_BENIGN_DISARM = ("no arm token", "arm_id mismatch (rearmed)")
+
+
+def _confirm_disarmed(service: ActivityService, *, arm_id: str | None) -> bool:
+    """Disarm and CONFIRM the token is gone, retrying transient failures. Returns
+    False only if, after retries, a real removal failure persists — the caller
+    must then NOT report a clean terminal (the token is still armed)."""
+    for _ in range(3):
+        d = disarm(service, arm_id=arm_id)
+        if d["disarmed"] or d.get("reason") in _BENIGN_DISARM:
+            return True
+    return False
+
 
 def run_daemon(service: ActivityService, *, poll: float = 5.0,
                claude_bin: str = "claude", once: bool = False,
@@ -279,12 +296,20 @@ def run_daemon(service: ActivityService, *, poll: float = 5.0,
             # loop and the terminal path disarms cleanly.
             stopping["flag"] = True
 
+    def finish(state: str, *, arm_id: str | None = None,
+               extra: dict | None = None) -> dict:
+        # Every terminal path funnels here so it ACTS on the disarm result: if
+        # the token could not be removed, report DISARM_FAILED (still armed)
+        # instead of a clean terminal — a later run must not re-drive silently.
+        if not _confirm_disarmed(service, arm_id=arm_id):
+            state = "DISARM_FAILED"
+        emit(state, extra)
+        return _result(state, transitions, **(extra or {}))
+
     try:
         while True:
             if stopping["flag"]:
-                disarm(service)
-                emit("SIGNALLED")
-                return _result("SIGNALLED", transitions)
+                return finish("SIGNALLED")
             armed = read_arm(service)
             if armed is None:
                 emit("IDLE")
@@ -293,9 +318,7 @@ def run_daemon(service: ActivityService, *, poll: float = 5.0,
                 time.sleep(poll)
                 continue
             if service.stop_check()["stop_requested"]:
-                disarm(service, arm_id=armed["arm_id"])
-                emit("STOPPED")
-                return _result("STOPPED", transitions)
+                return finish("STOPPED", arm_id=armed["arm_id"])
 
             emit("RUNNING", {"plan": armed["plan_id"], "arm_id": armed["arm_id"]})
             cfg = armed["config"]
@@ -326,22 +349,17 @@ def run_daemon(service: ActivityService, *, poll: float = 5.0,
                     timeout=cfg.get("timeout", 900.0), claude_bin=claude_bin,
                     runner=runner, service=service, guard=guard)
             except LoopError as exc:
-                disarm(service, arm_id=arm_id)
-                emit(exc.code)
-                return _result(exc.code, transitions)
+                return finish(exc.code, arm_id=arm_id)
             except Exception as exc:  # noqa: BLE001 — any failure must disarm
-                disarm(service, arm_id=arm_id)
-                emit("FAILED", {"error": f"{type(exc).__name__}: {exc}"})
-                return _result("FAILED", transitions)
+                return finish("FAILED", arm_id=arm_id,
+                              extra={"error": f"{type(exc).__name__}: {exc}"})
 
             cond = result["stop_condition"]
             # A loop COMPLETE = steps done, NOT accepted: report STEPS_COMPLETE
             # and disarm; the mediated final review/CONCLUSION/conclude is the
             # owner's, never the daemon's.
             state = "STEPS_COMPLETE" if cond == "COMPLETE" else cond
-            disarm(service, arm_id=arm_id)  # every terminal condition disarms
-            emit(state, {"turns": result["count"]})
-            return _result(state, transitions, turns=result["count"])
+            return finish(state, arm_id=arm_id, extra={"turns": result["count"]})
     finally:
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
