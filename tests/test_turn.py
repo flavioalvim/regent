@@ -23,7 +23,7 @@ def _fake_claude_runner(writes):
     real = SubprocessRunner()
 
     class Runner:
-        def run(self, argv, *, cwd, timeout, env=None):
+        def run(self, argv, *, cwd, timeout, env=None, cancel=None):
             if argv and argv[0] == "bash":  # the gate: run it for real
                 return real.run(argv, cwd=cwd, timeout=timeout, env=env)
             settings = json.loads(Path(argv[argv.index("--settings") + 1])
@@ -113,7 +113,7 @@ class TurnTest(unittest.TestCase):
         class EscapingRunner:
             def __init__(self, root):
                 self.root = root
-            def run(self, argv, *, cwd, timeout, env=None):
+            def run(self, argv, *, cwd, timeout, env=None, cancel=None):
                 (Path(cwd) / "escaped.txt").write_text("pwned", encoding="utf-8")
                 from regent.conduction.turnlog import append_terminal_seal
                 # note: no post event for this file → attribution violation
@@ -170,7 +170,7 @@ class TurnTest(unittest.TestCase):
     def test_agent_precreated_gate_evidence_is_violation(self):
         self._start_build()
         class PoisonRunner:
-            def run(self, argv, *, cwd, timeout, env=None):
+            def run(self, argv, *, cwd, timeout, env=None, cancel=None):
                 # agent writes the supervisor's gate evidence path itself
                 gate = Path(cwd) / ".regent/plans/PLAN-004/build/GATE-STEP-09.md"
                 gate.parent.mkdir(parents=True, exist_ok=True)
@@ -294,7 +294,7 @@ class TurnTest(unittest.TestCase):
     def test_nonzero_agent_exit_is_failure(self):
         self._start_build()
         class ExitOneRunner:
-            def run(self, argv, *, cwd, timeout, env=None):
+            def run(self, argv, *, cwd, timeout, env=None, cancel=None):
                 if argv and argv[0] == "bash":
                     from regent.conduction.process import SubprocessRunner
                     return SubprocessRunner().run(argv, cwd=cwd, timeout=timeout, env=env)

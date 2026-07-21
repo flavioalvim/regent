@@ -88,15 +88,13 @@ def _set_phase(service: ActivityService, phase: str) -> None:
         os.close(dfd)
 
 
-def _stopped_suspend(service, token, phase) -> None:
-    """A stop request mid-turn suspends the activity canonically (the mediator
-    resumes with /regent). Never swallowed: if the token was taken over, the
-    activity is no longer ours to suspend and the caller gets a CONFLICT."""
-    from ..protocol.stop import suspend_activity
+def _stopped_suspend(service, token, phase, *, reason="stop requested mid-turn") -> None:
+    """Suspend via the APPLICATION LAYER so the turn lock is RELEASED (PLAN-004's
+    protocol-level suspend left the lock held — corrected here per PLAN-005).
+    Never swallowed: a taken-over token → CONFLICT for the mediator."""
     from ..protocol.control import NotLockOwner as _NLO
     try:
-        suspend_activity(service.store, turn_token=token,
-                         checkpoint=f"turn:{phase}", reason="stop requested mid-turn")
+        service._suspend_locked(checkpoint=f"turn:{phase}", reason=reason)
     except _NLO:
         raise TurnError("CONFLICT", {"reason": "token diverged; cannot suspend "
                                      "(taken over?) — mediator must reconcile"})
@@ -126,7 +124,8 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
              gate_command: str, declared_in: Path, step: str,
              artifact_dir: Path, linkage: str, gate_envelope: list[str] | None = None,
              timeout: float = 900.0, claude_bin: str = "claude",
-             runner=None, service: ActivityService | None = None) -> dict:
+             runner=None, service: ActivityService | None = None,
+             attempt: int | None = None) -> dict:
     root = Path(root).resolve()
     service = service or ActivityService(root)
     artifact_dir = (root / artifact_dir).resolve() if not Path(artifact_dir).is_absolute() \
@@ -178,15 +177,22 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     # -- COMPOSED ---------------------------------------------------------
     _set_phase(service, "COMPOSED")
     turn = compose(envelope=envelope, claude_bin=claude_bin)
-    artifact = artifact_dir / f"TURN-{_slug(linkage)}.md"
-    gate_artifact = artifact_dir / f"GATE-{step_name}.md"
-    gate_full = artifact_dir / f"GATE-{step_name}.md-FULL.log"
+    sfx = f"-try{attempt}" if attempt is not None else ""
+    artifact = artifact_dir / f"TURN-{_slug(linkage)}{sfx}.md"
+    gate_artifact = artifact_dir / f"GATE-{step_name}{sfx}.md"
+    gate_full = artifact_dir / f"GATE-{step_name}{sfx}.md-FULL.log"
     evidence = EvidenceSet(artifact, {})
     evidence.precheck()
     outcome, claude_exit, attributed, commit_sha, detail = "FAILURE", None, [], None, ""
     gate_evidence_ours = True
+    import uuid as _uuid
+    from . import abort as _abort
+    cancel = threading.Event()
+    nonce = _uuid.uuid4().hex
+    _abort.write_turn_nonce(service.state_dir, nonce)
     stop = threading.Event()
-    beat = threading.Thread(target=_keepalive, args=(service, token, stop), daemon=True)
+    beat = threading.Thread(target=_keepalive,
+                            args=(service, token, stop, cancel, activity), daemon=True)
     beat.start()
     def _boundary(phase: str) -> None:
         service.heartbeat()
@@ -201,14 +207,17 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
         prompt = Path(prompt_file).read_text(encoding="utf-8")
         argv = launch_argv(turn, prompt=prompt, claude_bin=claude_bin)
         run = runner or SubprocessRunner()
-        result = run.run(argv, cwd=str(root), timeout=timeout, env=launch_env(turn))
+        result = run.run(argv, cwd=str(root), timeout=timeout,
+                         env=launch_env(turn), cancel=cancel)
         claude_exit = result.exit_code
         append_terminal_seal(turn.event_log, turn.secret)
         events = read_events(turn.event_log)
         _boundary("LAUNCHED")  # honor a stop during launch on ANY exit
         pre_gate_changes = {p for _s, p in changed_paths(root)}
 
-        if result.timed_out:
+        if getattr(result, "aborted", False):
+            outcome, detail = "ABORTED", "abort requested (agent killed)"
+        elif result.timed_out:
             outcome = "TIMEOUT"
         elif result.exit_code not in (0, None):
             outcome, detail = "FAILURE", f"claude exited {result.exit_code}"
@@ -260,11 +269,19 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
                                    attributed=len(attributed), detail=detail), body)
     except BaseException:
         stop.set(); beat.join(timeout=2)
+        _abort.clear_turn_nonce(service.state_dir)
         evidence.cleanup_orphans()
         turn.cleanup()
         raise
     stop.set(); beat.join(timeout=2)
+    _abort.clear_turn_nonce(service.state_dir)
     turn.cleanup()
+
+    # ABORTED suspends and never commits product/operational summary here.
+    if outcome == "ABORTED":
+        _stopped_suspend(service, token, "LAUNCHED", reason="abort requested")
+        return {"ok": False, "outcome": "ABORTED", "files_committed": [],
+                "artifact": str(artifact), "commit": None, "detail": detail}
 
     # -- COMMITTED (supervisor only) --------------------------------------
     # A stop that arrived during verify/attribute/evidence (for ANY outcome)
@@ -299,12 +316,24 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             "artifact": str(artifact), "commit": commit_sha, "detail": detail}
 
 
-def _keepalive(service, token, stop) -> None:
-    while not stop.wait(120):  # every 2 min, well under stale_after (1800s)
-        try:
-            service.lock.heartbeat(token)
-        except Exception:  # noqa: BLE001 — a lost token surfaces at commit fencing
-            return
+def _keepalive(service, token, stop, cancel=None, activity=None) -> None:
+    from . import abort as _abort
+    beats = 0
+    while not stop.wait(1):  # ~1s cadence for abort responsiveness
+        beats += 1
+        if cancel is not None and activity is not None:
+            claimed = _abort.claim_matching_abort(
+                service.state_dir, service.audit,
+                activity_id=activity["id"], activity_epoch=activity["epoch"],
+                turn_token=token)
+            if claimed is not None:
+                cancel.set()
+                return
+        if beats % 60 == 0:  # heartbeat every ~60s (well under stale 1800s)
+            try:
+                service.lock.heartbeat(token)
+            except Exception:  # noqa: BLE001 — a lost token surfaces at commit
+                return
 
 
 def _dirty_non_exempt(root: Path) -> bool:
