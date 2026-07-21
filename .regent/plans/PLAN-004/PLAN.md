@@ -1,9 +1,13 @@
-# PLAN-004 (v2) — Condução fase 2: o turno supervisionado com executor confinado
+# PLAN-004 (v3) — Condução fase 2: o turno supervisionado com executor confinado
 
-*v2 após ADVISOR-REVIEW-1 (7 objeções incorporadas — ver CLAUDE-REBUTTAL.md). Mudança
-central: a prova de atribuição REANCORADA no GIT (baseline global + blob verificado +
-índice privado + CAS de HEAD, como na IMP-003); o HMAC vira auditoria/defense-in-depth,
-NÃO anti-forja do agente (o agente é semi-confiável e pode ler o segredo).*
+*v2 após ADVISOR-REVIEW-1 (7 objeções). v3 incorpora VERBATIM os 3 residuais do
+ADVISOR-REVIEW-2 nos CONTRATOS: (1) vínculo rígido de --step ao plano aprovado + STEP
+corrente + gate daquele STEP + criação normativa de build/STEP-NN.md; (2) ordem
+GATED→VERIFIED com a prova cobrindo os efeitos do gate por RE-BASELINE (o gate escreve
+seus efeitos e a verificação final atribui TUDO — envelope declara os paths de efeito do
+gate); (3) fases com CHECKPOINT DURÁVEL no control + recuperação trailer→STEP→worktree +
+testes de crash por fronteira. Mudança central herdada do v2: prova de atribuição no GIT;
+HMAC = auditoria.*
 
 ## Objetivo
 
@@ -79,13 +83,22 @@ ensaio, publicação PyPI.
 `regent turn run --prompt-file P --envelope <path> [--envelope ...] --gate-command C
 --declared-in <plan> --step <PLAN-NNN/STEP-NN> --artifact-dir <sob .regent/> --linkage L
 [--timeout 900] [--claude-bin B]`
-- **Pré-condições:** atividade `build` ACTIVE + token corrente (camada de aplicação);
-  `--artifact-dir` sob `.regent/` (REQ-001) senão erro; `--declared-in` contém o
-  gate-command verbatim (proveniência, PLAN-003); **worktree limpo** exceto exceptuados.
-- **Fases** (idempotentes; heartbeat antes de cada; `stop check` entre elas → suspensão
-  canônica com checkpoint da fase): COMPOSED → LAUNCHED (claude confinado; keep-alive
-  heartbeat em thread durante o launch) → VERIFIED (turnlog: HMAC+selo, diff==atribuído)
-  → GATED (`run_gate` do PLAN-003; heartbeat antes) → COMMITTED.
+- **Pré-condições (vínculo REQ-005 rígido):** atividade `build` ACTIVE cujo `id` == o
+  `PLAN-NNN` de `--step`; `--step` referencia um STEP EXISTENTE no `PLAN.md` do
+  `--declared-in`, e é o STEP CORRENTE (o menor STEP-NN sem `build/STEP-NN.md`); o
+  `--gate-command` DEVE ser o gate declarado DAQUELE STEP (não um gate qualquer do plano);
+  token corrente; `--artifact-dir` sob `.regent/` (REQ-001) senão erro; **worktree limpo**
+  exceto exceptuados. O turno PRODUZ `build/STEP-NN.md` (files touched, gate outcome,
+  turno) como parte do commit — é assim que um STEP do REQ-005 nasce.
+- **Fases** (checkpoint DURÁVEL no control por fase; heartbeat antes de cada; `stop check`
+  entre elas → suspensão canônica com checkpoint da fase):
+  COMPOSED → LAUNCHED (claude confinado; keep-alive em thread) → GATED (`run_gate` do
+  PLAN-003 APÓS o agente; heartbeat antes) → VERIFIED → COMMITTED.
+  **A prova cobre os efeitos do gate:** o envelope declara os paths que o gate
+  legitimamente escreve (ex.: `dist/`); a verificação final roda DEPOIS do gate e atribui
+  TODO o diff global — paths de agente exigem evento `post`; paths de efeito-de-gate são
+  aceitos SÓ se ∈ envelope-de-gate declarado (subconjunto marcado do envelope), senão
+  `TURN_VIOLATION`. Nada alterado escapa da prova nem é falsamente atribuído ao agente.
 - **Commit do SUPERVISOR** (nunca o agente): índice PRIVADO (`GIT_INDEX_FILE`), stage
   arquivo-a-arquivo APENAS do conjunto atribuído (envelope ∩ eventos post ∩ diff) +
   artefatos do turno + exceptuados atribuíveis; **CAS de HEAD** (se HEAD mudou desde o
@@ -100,6 +113,17 @@ ensaio, publicação PyPI.
   `TURN_VIOLATION`(3), `TURN_TAMPERED`(3), `TURN_FAILED`(3).
 - **Gate RED / violação:** SEM commit de produto; evidência entra em commit OPERACIONAL;
   exit ≠0 (o chamador decide turno novo).
+
+### Recuperação por fase (durável, idempotente)
+Cada transição de fase grava o nome da fase no checkpoint da atividade (control, via a
+camada de aplicação — reusa `suspend`/estado). Recuperação por inspeção, nesta ordem:
+**trailer** (`git log --grep Regent-Turn:<linkage>` → COMMITTED, nada a fazer) →
+**STEP file** (`build/STEP-NN.md` presente → turno concluído) → **worktree/log**
+(log presente e íntegro → re-VERIFY+GATE+commit; log ausente/parcial → turno abortado,
+worktree sujo reportado ao mediador, NUNCA commitado). Reexecutar agente NÃO é idempotente
+por si — por isso um turno interrompido em LAUNCHED sem VERIFIED completo é DESCARTADO
+(worktree revertido aos paths do envelope só com ordem do mediador), não retomado no meio
+do agente. Testes de crash por fronteira (LAUNCHED/GATED/VERIFIED/pré-commit) validam.
 
 ### Fencing de token e timeout
 Timeout default do turno = **900s** (< `stale_after` 1800s da fase 1); heartbeats
@@ -140,8 +164,12 @@ adulteração (edição/remoção/injeção/reordenação/remoção-do-último),
   `test_gate_red_no_product_commit_evidence_operational`,
   `test_stop_between_phases_suspends_with_phase_checkpoint`,
   `test_requires_active_build_activity_and_token`, `test_artifact_dir_must_be_under_regent`,
+  `test_step_must_be_current_and_belong_to_declared_plan`,
+  `test_gate_command_must_match_step_gate`, `test_produces_step_nn_md`,
   `test_head_moved_since_baseline_conflicts`, `test_timeout_kills_claude_group`,
-  `test_keepalive_heartbeat_prevents_suspect`.
+  `test_keepalive_heartbeat_prevents_suspect`,
+  `test_recovery_committed_turn_is_noop`, `test_recovery_launched_without_verify_discarded`,
+  `test_crash_before_commit_recovered_by_inspection`.
 - **Gate:** `PYTHONPATH=src python3 -m unittest discover -s tests`
 
 ### STEP-04 — Consolidação 0.6.0
