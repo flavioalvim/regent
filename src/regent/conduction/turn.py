@@ -336,6 +336,11 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             except Violation as exc:
                 outcome, attributed, detail = "TURN_VIOLATION", [], str(exc.detail)
 
+        # Final abort check: an abort claimed during verify/attribute/evidence
+        # (the keepalive is still running) overrides the outcome — the evidence
+        # records ABORTED and the COMMITTED handler suspends without committing.
+        if cancel.is_set() and outcome not in ("ABORTED", "TIMEOUT"):
+            outcome, attributed, detail = "ABORTED", [], "abort requested during verify"
         body = _log_body(turn.event_log)
         evidence.write_main(header(outcome, claude_exit, linkage, base_sha=base_sha,
                                    attributed=len(attributed), detail=detail), body)
