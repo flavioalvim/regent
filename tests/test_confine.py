@@ -184,6 +184,30 @@ class AttributionTest(unittest.TestCase):
         with self.assertRaises(Violation):
             self._attribute(envelope=["work"])
 
+    def test_deletion_of_posted_path_is_violation(self):
+        (self.work / "gone.txt").write_text("baseline", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"],
+                       check=True)
+        self._write_and_post("work/gone.txt", "content")
+        (self.work / "gone.txt").unlink()  # deleted after the post
+        with self.assertRaises(Violation) as ctx:
+            self._attribute(envelope=["work"])
+        self.assertIn("deleted/missing", str(ctx.exception.detail))
+
+    def test_symlink_swap_after_post_is_violation(self):
+        import os
+        (self.work / "a.txt").write_text("baseline", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "base"],
+                       check=True)
+        self._write_and_post("work/a.txt", "declared")
+        (self.work / "a.txt").unlink()
+        os.symlink("/etc/hostname", self.work / "a.txt")  # regular → symlink
+        with self.assertRaises(Violation) as ctx:
+            self._attribute(envelope=["work"])
+        self.assertIn("symlink", str(ctx.exception.detail))
+
     def test_mode_change_after_post_is_violation(self):
         import os
         self._write_and_post("work/exe.txt", "content")

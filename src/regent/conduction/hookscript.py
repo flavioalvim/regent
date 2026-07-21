@@ -139,8 +139,11 @@ def _post(payload: dict) -> dict:
     tool_use_id = payload.get("tool_use_id", "")
     for path in _target_paths(tool_name, tool_input):
         try:
-            digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
-            mode = oct(os.stat(path).st_mode & 0o777)
+            if os.path.islink(path):
+                digest, mode = None, None  # symlink target: not attributable
+            else:
+                digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                mode = oct(os.lstat(path).st_mode & 0o777)
         except OSError:
             digest, mode = None, None
         _append_event({"kind": "post", "tool": tool_name,

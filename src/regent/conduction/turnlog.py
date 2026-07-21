@@ -109,6 +109,8 @@ def changed_paths(root: Path) -> list[tuple[str, str]]:
 
 def _blob_sha256(root: Path, path: str) -> str | None:
     full = Path(root) / path
+    if full.is_symlink():
+        return None  # never dereference; symlink writes are rejected upstream
     try:
         return hashlib.sha256(full.read_bytes()).hexdigest()
     except OSError:
@@ -165,10 +167,16 @@ def attribute_changes(root: Path, events: list[dict], *, envelope: list[str],
         if path in exempt:
             continue
         if path in posts:
-            if not _in(path, envelope):
+            full = root / path
+            if full.is_symlink():
+                # regular→symlink swap after the post: git stores a different
+                # type/blob than what was posted (checked before envelope, whose
+                # resolve() would also reject it, to give a specific reason).
+                violations.append({"path": path, "reason": "posted path is now a symlink"})
+            elif status.strip() == "D" or not full.exists():
+                violations.append({"path": path, "reason": "posted path deleted/missing"})
+            elif not _in(path, envelope):
                 violations.append({"path": path, "reason": "posted but outside envelope"})
-            elif status.strip() == "D":
-                attributed.append(path)
             else:
                 actual = _blob_sha256(root, path)
                 actual_mode = _file_mode(root, path)
@@ -195,13 +203,14 @@ def attribute_changes(root: Path, events: list[dict], *, envelope: list[str],
 def _file_mode(root: Path, path: str) -> str | None:
     try:
         import os
-        return oct((root / path).stat().st_mode & 0o777)
+        return oct(os.lstat(root / path).st_mode & 0o777)  # lstat: no deref
     except OSError:
         return None
 
 
 def _rel(root: Path, path: str) -> str:
+    p = Path(path)
     try:
-        return str(Path(path).resolve().relative_to(root))
+        return str((p.parent.resolve() / p.name).relative_to(root))
     except (ValueError, OSError):
         return path

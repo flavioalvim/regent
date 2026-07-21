@@ -154,6 +154,45 @@ class TurnTest(unittest.TestCase):
                 linkage="x", runner=_fake_claude_runner([]), service=self.service)
         self.assertEqual(ctx.exception.code, "ARTIFACT_OUTSIDE_REGENT")
 
+    def test_build_symlink_escape_refused(self):
+        import os
+        self._start_build()
+        # replace the build dir with a symlink pointing outside the repo
+        outside = Path(self._tmp.name) / "evil-build"
+        outside.mkdir()
+        import shutil
+        shutil.rmtree(self.artdir)
+        os.symlink(outside, self.artdir)
+        with self.assertRaises(turnmod.TurnError) as ctx:
+            self._run(_fake_claude_runner([("work/out.txt", "hi", True)]))
+        self.assertEqual(ctx.exception.code, "ARTIFACT_OUTSIDE_REGENT")
+
+    def test_agent_precreated_gate_evidence_is_violation(self):
+        self._start_build()
+        class PoisonRunner:
+            def run(self, argv, *, cwd, timeout, env=None):
+                # agent writes the supervisor's gate evidence path itself
+                gate = Path(cwd) / ".regent/plans/PLAN-004/build/GATE-STEP-09.md"
+                gate.parent.mkdir(parents=True, exist_ok=True)
+                gate.write_text("forged gate evidence", encoding="utf-8")
+                return RunResult(0, b"", False)
+        result = self._run(PoisonRunner())
+        self.assertIn(result["outcome"], ("TURN_VIOLATION", "GATE_RED"))
+        self.assertFalse(result["ok"])
+        # the forged gate file is NOT committed
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root), "ls-files",
+             ".regent/plans/PLAN-004/build/GATE-STEP-09.md"],
+            capture_output=True, text=True).stdout.strip(), "")
+
+    def test_stop_during_turn_suspends_activity(self):
+        self._start_build()
+        self.service.stop_request(reason="owner stops mid-turn")
+        with self.assertRaises(turnmod.TurnError) as ctx:
+            self._run(_fake_claude_runner([("work/out.txt", "hi", True)]))
+        self.assertEqual(ctx.exception.code, "STOPPED")
+        self.assertEqual(self.service.store.load()["activity"]["state"], "SUSPENDED")
+
     def test_recover_turn_reports_committed_step_and_partial(self):
         self._start_build()
         r = self._run(_fake_claude_runner([("work/out.txt", "hi", True)]))

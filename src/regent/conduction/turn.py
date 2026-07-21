@@ -81,6 +81,22 @@ def _set_phase(service: ActivityService, phase: str) -> None:
     finally:
         os.close(fd)
     os.replace(tmp, target)
+    dfd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _stopped_suspend(service, token, phase) -> None:
+    """A stop request mid-turn suspends the activity canonically (the mediator
+    resumes with /regent). Best-effort: a lost token surfaces as its own error."""
+    try:
+        from ..protocol.stop import suspend_activity
+        suspend_activity(service.store, turn_token=token,
+                         checkpoint=f"turn:{phase}", reason="stop requested mid-turn")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def recover_turn(root: Path, *, linkage: str, step: str,
@@ -133,7 +149,9 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
         raise TurnError("STEP_MISMATCH", {"declared_in": str(declared_in),
                                           "expected": str(expected_plan)})
     canonical_build = (root / ".regent" / "plans" / plan_id / "build").resolve()
-    if artifact_dir != canonical_build:
+    if artifact_dir != canonical_build or not _under(root, artifact_dir):
+        # equality AND real containment: a `build` symlink pointing outside the
+        # repo resolves away and fails _under.
         raise TurnError("ARTIFACT_OUTSIDE_REGENT",
                         {"artifact_dir": str(artifact_dir),
                          "expected": str(canonical_build)})
@@ -163,12 +181,14 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
     evidence = EvidenceSet(artifact, {})
     evidence.precheck()
     outcome, claude_exit, attributed, commit_sha, detail = "FAILURE", None, [], None, ""
+    gate_evidence_ours = True
     stop = threading.Event()
     beat = threading.Thread(target=_keepalive, args=(service, token, stop), daemon=True)
     beat.start()
     try:
         service.heartbeat()
         if service.stop_check()["stop_requested"]:
+            _stopped_suspend(service, token, "COMPOSED")
             raise TurnError("STOPPED", {"phase": "COMPOSED"})
         # -- LAUNCHED -----------------------------------------------------
         _set_phase(service, "LAUNCHED")
@@ -190,11 +210,20 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
             _set_phase(service, "GATED")
             service.heartbeat()
             if service.stop_check()["stop_requested"]:
-                raise TurnError("STOPPED", {"phase": "GATED"})
+                _stopped_suspend(service, token, "LAUNCHED")
+                raise TurnError("STOPPED", {"phase": "LAUNCHED"})
+            from .evidence import EvidenceConflict
+            gate_conflict = False
             try:
                 gate = run_gate(root, command=gate_command, declared_in=declared_in,
                                 artifact=gate_artifact, linkage=step, runner=run)
                 gate_outcome = gate["outcome"]
+            except EvidenceConflict:
+                # The agent pre-created the supervisor's gate evidence path — a
+                # confinement breach, not a gate result. It is NOT exempted and
+                # NEVER committed.
+                gate_conflict, gate_outcome = True, "GATE_CONFLICT"
+                gate_evidence_ours = False
             except Exception as exc:  # noqa: BLE001
                 gate_outcome = f"GATE_ERROR:{exc}"
             gate_effects = [str(root / p) for _s, p in changed_paths(root)
@@ -202,9 +231,14 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
 
             # -- VERIFIED -------------------------------------------------
             _set_phase(service, "VERIFIED")
+            if service.stop_check()["stop_requested"]:
+                _stopped_suspend(service, token, "GATED")
+                raise TurnError("STOPPED", {"phase": "GATED"})
             exemption_files = EXEMPTIONS + [
-                str(gate_artifact.relative_to(root)), str(gate_full.relative_to(root)),
                 str(artifact.relative_to(root)), str(step_file.relative_to(root))]
+            if not gate_conflict:  # only exempt supervisor-written gate evidence
+                exemption_files += [str(gate_artifact.relative_to(root)),
+                                    str(gate_full.relative_to(root))]
             try:
                 verify_chain(turn.event_log, turn.secret)
                 attributed = attribute_changes(
@@ -245,8 +279,8 @@ def run_turn(root: Path, *, prompt_file: Path, envelope: list[str],
                                         step=step, linkage=linkage, token=token,
                                         service=service)
     else:
-        extra = [str(p.relative_to(root)) for p in (gate_artifact, gate_full)
-                 if p.exists()]
+        extra = ([str(p.relative_to(root)) for p in (gate_artifact, gate_full)
+                  if p.exists()] if gate_evidence_ours else [])
         commit_sha = _operational_commit(
             root, base_sha, [str(artifact.relative_to(root))] + extra,
             linkage=linkage, outcome=outcome, token=token, service=service)
